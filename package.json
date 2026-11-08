@@ -1,6 +1,6 @@
 {
   "name": "deepseek-agent-acp",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Agent Client Protocol (ACP) adapter for DeepSeek reasoning and chat models with Model Context Protocol (MCP) tool execution",
   "type": "module",
   "main": "dist/index.js",

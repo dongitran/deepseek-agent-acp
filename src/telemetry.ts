@@ -180,9 +180,9 @@ export interface NostrMetadata {
  * Isolates the active envelope using lastIndexOf('Event ID:') to prevent
  * capturing cancelled or steered predecessor messages.
  */
-export function parseNostrContext(rawText: string): NostrMetadata {
+export function parseNostrContext(rawText: unknown): NostrMetadata {
   const result: NostrMetadata = {};
-  if (!rawText) {
+  if (typeof rawText !== 'string' || !rawText) {
     return result;
   }
 

@@ -163,6 +163,52 @@ test('ACP session/prompt streams content and returns final message using mock HT
   }
 });
 
+test('ACP session/prompt accepts prompt as array of ContentBlocks (ACP standard format)', async () => {
+  const server = http.createServer((req, res) => {
+    if (req.url === '/chat/completions') {
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        Connection: 'keep-alive'
+      });
+      res.write('data: {"choices":[{"delta":{"content":"ACP ContentBlock parsed correctly!"},"finish_reason":"stop"}]}\n\n');
+      res.write('data: [DONE]\n\n');
+      res.end();
+    }
+  });
+
+  await new Promise((res) => server.listen(0, '127.0.0.1', res));
+  const port = server.address().port;
+  const mockBaseUrl = `http://127.0.0.1:${port}`;
+
+  const { child, send, waitResponse } = spawnAdapter({
+    DEEPSEEK_BASE_URL: mockBaseUrl
+  });
+
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 11,
+      method: 'session/prompt',
+      params: {
+        sessionId: 'contentblock-sess',
+        prompt: [
+          { type: 'text', text: 'Hello from ACP content block 1\n' },
+          { type: 'text', text: 'Event ID: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }
+        ]
+      }
+    });
+
+    const res = await waitResponse(11, 5000);
+    assert.equal(res.id, 11);
+    assert.equal(res.result.message.content, 'ACP ContentBlock parsed correctly!');
+    assert.equal(res.result.stopReason, 'end_turn');
+  } finally {
+    child.kill();
+    server.close();
+  }
+});
+
 test('Truncated stream on tool call injects synthetic tool error', async () => {
   let callCount = 0;
   const server = http.createServer((req, res) => {

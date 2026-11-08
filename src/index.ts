@@ -307,11 +307,54 @@ async function handleRpcMessage(rpc: JSONRPCRequest): Promise<void> {
 }
 
 /**
+ * Extract clean prompt text from ACP params supporting string, ContentBlock[], or nested structures.
+ */
+export function extractPromptText(params?: Record<string, unknown>): string {
+  if (!params) {
+    return '';
+  }
+  const prompt = params.prompt ?? params.message ?? params.text;
+  if (typeof prompt === 'string') {
+    return prompt;
+  }
+  if (Array.isArray(prompt)) {
+    return prompt
+      .map((block: unknown) => {
+        if (typeof block === 'string') {
+          return block;
+        }
+        if (block && typeof block === 'object') {
+          const rec = block as Record<string, unknown>;
+          if (typeof rec.text === 'string') {
+            return rec.text;
+          }
+          if (typeof rec.content === 'string') {
+            return rec.content;
+          }
+        }
+        return '';
+      })
+      .filter(Boolean)
+      .join('\n');
+  }
+  if (prompt && typeof prompt === 'object') {
+    const rec = prompt as Record<string, unknown>;
+    if (typeof rec.text === 'string') {
+      return rec.text;
+    }
+    if (typeof rec.content === 'string') {
+      return rec.content;
+    }
+  }
+  return '';
+}
+
+/**
  * Handle ACP session/prompt execution with multi-turn tool loops.
  */
 async function handleSessionPrompt(id?: string | number, params?: Record<string, unknown>): Promise<void> {
   const sessionId = (params?.sessionId as string) || `session-${Date.now().toString()}`;
-  const promptText = (params?.prompt as string) || (params?.message as string) || (params?.text as string) || '';
+  const promptText = extractPromptText(params);
 
   let session = sessions.get(sessionId);
   if (!session) {

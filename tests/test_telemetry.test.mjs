@@ -113,6 +113,13 @@ Active steered question.`;
   assert.equal(meta.senderName, 'NewUser');
 });
 
+test('parseNostrContext: non-string inputs (array, object, null, undefined) safely return empty object', () => {
+  assert.deepEqual(parseNostrContext(null), {});
+  assert.deepEqual(parseNostrContext(undefined), {});
+  assert.deepEqual(parseNostrContext([{ type: 'text', text: 'Event ID: 1234' }]), {});
+  assert.deepEqual(parseNostrContext(12345), {});
+});
+
 test('extractPostedEventId: extracts 64-hex ID from buzz-thread reply tool output', () => {
   const replyOutput = 'posted (128 characters) · event_id 40738780fa35899d341c45daeda99e609aff92c6d3cb44c54e06e7290e7bb38b';
   const extracted = extractPostedEventId(replyOutput);
