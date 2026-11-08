@@ -16,6 +16,13 @@ import readline from 'node:readline';
 import { format } from 'node:util';
 import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
 import { McpClient } from './mcp-client.js';
+import {
+  initTelemetry,
+  registerSecret,
+  parseNostrContext,
+  type TelemetryService,
+  type TurnSpanHandle
+} from './telemetry.js';
 import type {
   ChatMessage,
   JSONRPCRequest,
@@ -93,6 +100,12 @@ const DEEPSEEK_API_KEY = loadSecretKey();
 if (!DEEPSEEK_API_KEY) {
   console.warn('DEEPSEEK_API_KEY is not set. Ensure secrets are provided in environment or secrets file.');
 }
+registerSecret(DEEPSEEK_API_KEY);
+
+// OpenTelemetry & Arize Phoenix Telemetry Service
+const telemetryService: TelemetryService | null = initTelemetry({
+  secrets: DEEPSEEK_API_KEY ? [DEEPSEEK_API_KEY] : []
+});
 
 // Configuration
 const BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').replace(/\/+$/, '');
@@ -322,6 +335,14 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
   session.messages.push({ role: 'user', content: promptText });
 
+  const nostrMeta = parseNostrContext(promptText);
+  const turnHandle: TurnSpanHandle | undefined = telemetryService?.startTurnSpan(
+    sessionId,
+    promptText,
+    MODEL,
+    nostrMeta
+  );
+
   const maxIterations = getIterationLimit(MODEL);
   let iteration = 0;
   let lastToolError: string | null = null;
@@ -338,6 +359,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
       iteration++;
       console.info(`Turn iteration ${iteration.toString()}/${maxIterations.toString()} for session ${sessionId}`);
+      const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration);
 
       // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
       const messagesPayload = session.messages.map((m) => {
@@ -379,13 +401,15 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
           messages: messagesPayload,
           tools: tools && tools.length > 0 ? tools : undefined,
           temperature: TEMPERATURE,
-          stream: true
+          stream: true,
+          stream_options: { include_usage: true }
         }),
         signal: combinedSignal
       });
 
       if (!response.ok) {
         const errorText = await response.text();
+        llmSpan?.end(undefined, `DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
         throw new Error(`DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
       }
 
@@ -394,6 +418,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
       for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
         if (session.abortController?.signal?.aborted || !session.abortController) {
+          llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
           throw new Error('Stream aborted by client cancellation.');
         }
 
@@ -426,6 +451,11 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         accumulator = new StreamAccumulator();
       }
 
+      if (accumulator.usage) {
+        llmSpan?.recordUsage(accumulator.usage);
+        turnHandle?.recordUsage(accumulator.usage);
+      }
+
       // Build assistant message
       const assistantMsg: ChatMessage = {
         role: 'assistant',
@@ -439,6 +469,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       // Truncated Stream / Synthetic Tool Error
       if (accumulator.isTruncated() && accumulator.toolCalls.length > 0) {
         console.warn(`[SAFE STREAM] finish_reason === 'length' on tool call. Injecting synthetic tool error.`);
+        llmSpan?.end(undefined, 'Tool execution truncated due to token limits.');
         assistantMsg.tool_calls = accumulator.toolCalls.map((tc) => ({
           id: tc.id,
           type: 'function',
@@ -475,9 +506,13 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
       // No tool calls means the model produced its final response text
       if (validToolCalls.length === 0) {
+        llmSpan?.end(accumulator.content || undefined);
         session.messages.push(assistantMsg);
         session.commit();
         turnCompleted = true;
+
+        turnHandle?.end('OK', accumulator.content || '');
+        void telemetryService?.backgroundFlush();
 
         sendResponse(id, {
           sessionId,
@@ -491,7 +526,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         return;
       }
 
-      // Tool calls were produced
+      // Tool calls were produced: close current iteration's LLM span before executing tools
+      llmSpan?.end(accumulator.content || undefined);
       assistantMsg.tool_calls = validToolCalls;
       session.messages.push(assistantMsg);
 
@@ -507,6 +543,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
           const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
           console.warn(`JSON parse error on tool arguments for ${tc.function.name}: ${msg}`);
           const errorMsg = `Tool execution truncated due to token limits: malformed JSON arguments (${msg})`;
+          turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
+          turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
           session.messages.push({
             role: 'tool',
             tool_call_id: tc.id,
@@ -538,6 +576,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
         const argsPreview = JSON.stringify(parsedArgs).slice(0, 150);
         console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
+        turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
         const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
         console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
 
@@ -558,6 +597,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         } catch {
           // Ignored
         }
+
+        turnHandle?.endToolSpan(tc.id, toolResult, Boolean(errorString), tc.function.name);
 
         if (errorString) {
           if (lastToolError === errorString) {
@@ -610,6 +651,10 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       const finalContent = iteration >= maxIterations
         ? (session.messages[session.messages.length - 1]?.content ?? 'Turn reached maximum iteration limit.')
         : 'Turn execution stopped because repetitive tool errors occurred.';
+
+      turnHandle?.end('OK', finalContent);
+      void telemetryService?.backgroundFlush();
+
       sendResponse(id, {
         sessionId,
         message: {
@@ -626,6 +671,17 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
     // Rollback session state on error
     session.rollback();
+
+    const isCancelled =
+      session.abortController?.signal?.aborted ||
+      (err instanceof Error && (err.name === 'AbortError' || err.message.includes('cancellation')));
+
+    if (isCancelled) {
+      turnHandle?.end('CANCELLED');
+    } else {
+      turnHandle?.end('ERROR', undefined, 'turn_failed', msg);
+    }
+    void telemetryService?.backgroundFlush();
 
     sendNotification('session/update', {
       sessionId,
@@ -672,31 +728,36 @@ rl.on('line', (line: string) => {
   }
 });
 
-const shutdown = (signal?: string): void => {
+const shutdown = async (signal?: string): Promise<void> => {
   if (signal) {
     console.info(`Received ${signal}, closing...`);
   } else {
     console.info('Stdin closed. Shutting down adapter...');
   }
-  mcpClient
-    .close()
-    .catch((err: unknown) => {
-      console.error('Error during shutdown:', err);
-    })
-    .finally(() => {
-      process.exit(0);
-    });
+  try {
+    await mcpClient.close();
+  } catch (err: unknown) {
+    console.error('Error during MCP client close:', err);
+  }
+  try {
+    if (telemetryService) {
+      await telemetryService.shutdown();
+    }
+  } catch (err: unknown) {
+    console.error('Error during telemetry shutdown:', err);
+  }
+  process.exit(0);
 };
 
 rl.on('close', () => {
-  shutdown();
+  void shutdown();
 });
 
 // Handle graceful termination signals
 process.on('SIGTERM', () => {
-  shutdown('SIGTERM');
+  void shutdown('SIGTERM');
 });
 
 process.on('SIGINT', () => {
-  shutdown('SIGINT');
+  void shutdown('SIGINT');
 });
