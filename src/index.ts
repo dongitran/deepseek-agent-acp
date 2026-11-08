@@ -1,0 +1,688 @@
+#!/usr/bin/env node
+/**
+ * index.ts — Native Agent Client Protocol (ACP) Adapter for DeepSeek reasoning and chat models.
+ * Implements:
+ * - Line-delimited JSON-RPC over stdin/stdout (initialize, session/new, session/cancel, session/prompt).
+ * - Stdio hygiene (all logging redirected to stderr; stdout strictly reserved for JSON-RPC).
+ * - In-memory secret loading and sanitization (strips API key from process.env immediately).
+ * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
+ * - Transactional state checkpointing and rollback on session/cancel.
+ * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row).
+ * - Full Model Context Protocol (MCP) tool execution.
+ */
+
+import fs from 'node:fs';
+import readline from 'node:readline';
+import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
+import { McpClient } from './mcp-client.js';
+import type {
+  ChatMessage,
+  JSONRPCRequest,
+  JSONRPCResponse,
+  JSONRPCNotification,
+  ToolCall
+} from './types.js';
+
+// ============================================================================
+// 1. STDIO HYGIENE
+// Redirect all console output to process.stderr so process.stdout is 100%
+// dedicated to ACP JSON-RPC frames. Any stray write to stdout corrupts JSON-RPC.
+// ============================================================================
+const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+const originalStderrWrite = process.stderr.write.bind(process.stderr);
+
+// eslint-disable-next-line no-console
+console.log = (...args: unknown[]) => {
+  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  originalStderrWrite(`[deepseek-acp:INFO] ${msg}\n`);
+};
+// eslint-disable-next-line no-console
+console.info = console.log;
+console.warn = (...args: unknown[]) => {
+  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  originalStderrWrite(`[deepseek-acp:WARN] ${msg}\n`);
+};
+console.error = (...args: unknown[]) => {
+  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
+  originalStderrWrite(`[deepseek-acp:ERROR] ${msg}\n`);
+};
+
+// ============================================================================
+// 2. SECRET LOADING & IN-MEMORY SANITIZATION
+// Loads key into in-memory constant and immediately deletes environment variables.
+// ============================================================================
+export function loadSecretKey(secretsPath = '/run/agent-secrets/env'): string {
+  let key = process.env.DEEPSEEK_API_KEY ?? process.env.DEEPSEEK_AUTH_TOKEN ?? '';
+  if (!key && fs.existsSync(secretsPath)) {
+    try {
+      const fileData = fs.readFileSync(secretsPath, 'utf-8');
+      for (const line of fileData.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) {
+          continue;
+        }
+        const [k, ...vParts] = trimmed.split('=');
+        const v = vParts.join('=');
+        if (k && (k.toUpperCase().startsWith('DEEPSEEK_') || k.toUpperCase() === 'API_KEY')) {
+          key = Buffer.from(v, 'base64').toString('utf-8').trim();
+          if (key) {
+            break;
+          }
+        }
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.warn(`Could not read ${secretsPath}: ${msg}`);
+    }
+  }
+
+  // Delete secret keys from environment immediately (in-memory sanitization)
+  delete process.env.DEEPSEEK_API_KEY;
+  delete process.env.DEEPSEEK_AUTH_TOKEN;
+  delete process.env.DEEPSEEK_TOKEN;
+  delete process.env.DEEPSEEK_ELIO;
+
+  return key;
+}
+
+const DEEPSEEK_API_KEY = loadSecretKey();
+if (!DEEPSEEK_API_KEY) {
+  console.warn('DEEPSEEK_API_KEY is not set. Ensure secrets are provided in environment or secrets file.');
+}
+
+// Configuration
+const BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').replace(/\/+$/, '');
+const MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat';
+const TEMPERATURE = parseFloat(process.env.DEEPSEEK_TEMPERATURE ?? '0.0');
+const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMMAND ?? 'buzz-dev-mcp';
+
+// ============================================================================
+// 3. PROMPT ADAPTATION LAYER
+// ============================================================================
+function adaptSystemPrompt(rawPrompt: string, model: string): string {
+  let prompt = rawPrompt
+    .replace(/\/home\/agent\/\.claude[a-zA-Z0-9_/.-]*/g, '')
+    .replace(/CLAUDE\.md/g, 'AGENTS.md')
+    .replace(/claude-agent-acp/g, 'deepseek-agent-acp')
+    .replace(/MAX_THINKING_TOKENS[^\n]*/g, '')
+    .replace(/Use the `Skill tool`[^\n]*/g, 'Consult domain instructions when available.')
+    .replace(/Claude Code/g, 'DeepSeek Autonomous Engine')
+    .trim();
+
+  if (model.includes('reasoner') || model.includes('r1')) {
+    prompt += `\n\n[SYSTEM ADAPTATION: DEEPSEEK-R1 ENFORCEMENT]
+- Be concise and direct in your reasoning. Avoid repetitive philosophical deliberation.
+- Do not invent tools. Use ONLY the provided tools.
+- Structure your final response using clean GitHub-flavored Markdown.`;
+  }
+  return prompt;
+}
+
+function getSystemPrompt(model: string): string {
+  const filePath = process.env.ACP_SYSTEM_PROMPT_FILE ?? process.env.BUZZ_ACP_SYSTEM_PROMPT_FILE ?? './system-prompt.md';
+  let raw = 'You are an autonomous AI software engineer.';
+  if (fs.existsSync(filePath)) {
+    try {
+      raw = fs.readFileSync(filePath, 'utf-8');
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      console.warn(`Could not read system prompt file: ${msg}`);
+    }
+  }
+  return adaptSystemPrompt(raw, model);
+}
+
+function getIterationLimit(model: string): number {
+  const maxIterEnv = process.env.ACP_MAX_ITERATIONS ?? process.env.BUZZ_MAX_ITERATIONS;
+  if (maxIterEnv) {
+    const val = parseInt(maxIterEnv, 10);
+    if (!isNaN(val) && val > 0) {
+      return val;
+    }
+  }
+  const isCoder =
+    model.includes('coder') ||
+    process.env.AGENT_ROLE === 'coder' ||
+    process.env.AGENT_ROLE === 'builder';
+  return isCoder ? 25 : 15;
+}
+
+// ============================================================================
+// 4. SESSION & TRANSACTIONAL STATE MANAGER
+// ============================================================================
+class Session {
+  public sessionId: string;
+  public messages: ChatMessage[];
+  public checkpoint: ChatMessage[];
+  public abortController: AbortController | null = null;
+  public activePromptId: string | number | null = null;
+
+  constructor(sessionId: string) {
+    this.sessionId = sessionId;
+    const sysPrompt = getSystemPrompt(MODEL);
+    this.messages = [{ role: 'system', content: sysPrompt }];
+    this.checkpoint = [{ role: 'system', content: sysPrompt }];
+  }
+
+  takeSnapshot(): void {
+    this.checkpoint = JSON.parse(JSON.stringify(this.messages)) as ChatMessage[];
+  }
+
+  commit(): void {
+    this.checkpoint = JSON.parse(JSON.stringify(this.messages)) as ChatMessage[];
+  }
+
+  rollback(): void {
+    if (this.abortController) {
+      this.abortController.abort();
+      this.abortController = null;
+    }
+    this.messages = JSON.parse(JSON.stringify(this.checkpoint)) as ChatMessage[];
+    console.info(`[TRANSACTION] Rolled back session ${this.sessionId} to previous checkpoint.`);
+  }
+}
+
+// ============================================================================
+// 5. ACP PROTOCOL ENGINE
+// ============================================================================
+const sessions = new Map<string, Session>();
+const mcpClient = new McpClient(MCP_COMMAND);
+
+// Initialize MCP client in background
+mcpClient.init().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.warn(`MCP client initial connection failed: ${msg}. Will retry on tool access.`);
+});
+
+function sendRpc(obj: JSONRPCRequest | JSONRPCResponse | JSONRPCNotification): void {
+  originalStdoutWrite(JSON.stringify(obj) + '\n');
+}
+
+function sendResponse(id?: string | number, result?: unknown, error?: { code: number; message: string; data?: unknown }): void {
+  if (id === undefined || id === null) {
+    return;
+  }
+  const res: JSONRPCResponse = { jsonrpc: '2.0', id };
+  if (error) {
+    res.error = error;
+  } else {
+    res.result = result !== undefined ? result : {};
+  }
+  sendRpc(res);
+}
+
+function sendNotification(method: string, params: Record<string, unknown>): void {
+  sendRpc({ jsonrpc: '2.0', method, params });
+}
+
+/**
+ * Handle incoming ACP JSON-RPC message.
+ */
+async function handleRpcMessage(rpc: JSONRPCRequest): Promise<void> {
+  if (!rpc || typeof rpc !== 'object') {
+    return;
+  }
+  const { id, method, params } = rpc;
+
+  try {
+    switch (method) {
+      case 'initialize': {
+        sendResponse(id, {
+          protocolVersion: 1,
+          agentInfo: {
+            name: 'deepseek-agent-acp',
+            version: '1.0.0'
+          },
+          capabilities: {
+            streaming: true,
+            tools: true,
+            sessionCancellation: true
+          }
+        });
+        break;
+      }
+
+      case 'session/new': {
+        const sessionId = (params?.sessionId as string) || `session-${Date.now().toString()}`;
+        sessions.set(sessionId, new Session(sessionId));
+        sendResponse(id, { sessionId });
+        break;
+      }
+
+      case 'session/cancel': {
+        const sessionId = params?.sessionId as string | undefined;
+        const session = sessionId ? sessions.get(sessionId) : undefined;
+        if (session) {
+          session.rollback();
+          sendResponse(id, { cancelled: true });
+        } else {
+          sendResponse(id, { cancelled: false, reason: 'Session not found' });
+        }
+        break;
+      }
+
+      case 'session/prompt': {
+        await handleSessionPrompt(id, params);
+        break;
+      }
+
+      default: {
+        console.warn(`Unhandled method: ${method}`);
+        if (id !== undefined && id !== null) {
+          sendResponse(id, null, {
+            code: -32601,
+            message: `Method not found: ${method}`
+          });
+        }
+        break;
+      }
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Error handling method ${method}: ${msg}`);
+    if (id !== undefined && id !== null) {
+      sendResponse(id, null, {
+        code: -32000,
+        message: msg
+      });
+    }
+  }
+}
+
+/**
+ * Handle ACP session/prompt execution with multi-turn tool loops.
+ */
+async function handleSessionPrompt(id?: string | number, params?: Record<string, unknown>): Promise<void> {
+  const sessionId = (params?.sessionId as string) || `session-${Date.now().toString()}`;
+  const promptText = (params?.prompt as string) || (params?.message as string) || (params?.text as string) || '';
+
+  let session = sessions.get(sessionId);
+  if (!session) {
+    session = new Session(sessionId);
+    sessions.set(sessionId, session);
+  }
+
+  // Guard against concurrent session/prompt calls on the same session
+  if (session.activePromptId) {
+    sendResponse(id, null, {
+      code: -32000,
+      message: `Session ${sessionId} is busy processing prompt ${String(session.activePromptId)}`
+    });
+    return;
+  }
+
+  // Transactional Snapshot BEFORE prompt execution
+  session.takeSnapshot();
+  session.abortController = new AbortController();
+  session.activePromptId = id ?? null;
+
+  session.messages.push({ role: 'user', content: promptText });
+
+  const maxIterations = getIterationLimit(MODEL);
+  let iteration = 0;
+  let lastToolError: string | null = null;
+  let consecutiveErrorCount = 0;
+  let turnCompleted = false;
+
+  try {
+    const tools = await mcpClient.getTools();
+
+    while (iteration < maxIterations) {
+      if (session.abortController?.signal?.aborted || !session.abortController) {
+        throw new Error('Turn was aborted by cancellation signal.');
+      }
+
+      iteration++;
+      console.info(`Turn iteration ${iteration.toString()}/${maxIterations.toString()} for session ${sessionId}`);
+
+      // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
+      const messagesPayload = session.messages.map((m) => {
+        const msg: ChatMessage = {
+          role: m.role,
+          content: m.content
+        };
+        if (m.reasoning_content) {
+          msg.reasoning_content = m.reasoning_content;
+        }
+        if (m.tool_calls) {
+          msg.tool_calls = m.tool_calls;
+        }
+        if (m.tool_call_id) {
+          msg.tool_call_id = m.tool_call_id;
+        }
+        return msg;
+      });
+
+      if (!DEEPSEEK_API_KEY) {
+        throw new Error('DEEPSEEK_API_KEY is missing or empty. Cannot authenticate with DeepSeek API.');
+      }
+
+      // Call DeepSeek Chat Completions with Streaming with 90s request timeout
+      const requestTimeoutMs = parseInt(process.env.DEEPSEEK_REQUEST_TIMEOUT_MS ?? '90000', 10);
+      const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
+      const combinedSignal = session.abortController
+        ? AbortSignal.any([session.abortController.signal, timeoutSignal])
+        : timeoutSignal;
+
+      const response = await fetch(`${BASE_URL}/chat/completions`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${DEEPSEEK_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          messages: messagesPayload,
+          tools: tools && tools.length > 0 ? tools : undefined,
+          temperature: TEMPERATURE,
+          stream: true
+        }),
+        signal: combinedSignal
+      });
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
+      }
+
+      // Stream accumulator for 3-phase events
+      let accumulator: StreamAccumulator | null = null;
+
+      for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+        if (session.abortController?.signal?.aborted || !session.abortController) {
+          throw new Error('Stream aborted by client cancellation.');
+        }
+
+        if (event.type === 'delta') {
+          if (event.reasoningDelta) {
+            sendNotification('session/update', {
+              sessionId,
+              delta: {
+                type: 'thought',
+                text: event.reasoningDelta
+              }
+            });
+          }
+          if (event.contentDelta) {
+            sendNotification('session/update', {
+              sessionId,
+              delta: {
+                type: 'text',
+                text: event.contentDelta
+              }
+            });
+          }
+        }
+        if (event.accumulator) {
+          accumulator = event.accumulator as StreamAccumulator;
+        }
+      }
+
+      if (!accumulator) {
+        accumulator = new StreamAccumulator();
+      }
+
+      // Build assistant message
+      const assistantMsg: ChatMessage = {
+        role: 'assistant',
+        content: accumulator.content || null
+      };
+
+      if (accumulator.reasoningContent) {
+        assistantMsg.reasoning_content = accumulator.reasoningContent;
+      }
+
+      // Truncated Stream / Synthetic Tool Error
+      if (accumulator.isTruncated() && accumulator.toolCalls.length > 0) {
+        console.warn(`[SAFE STREAM] finish_reason === 'length' on tool call. Injecting synthetic tool error.`);
+        assistantMsg.tool_calls = accumulator.toolCalls.map((tc) => ({
+          id: tc.id,
+          type: 'function',
+          function: {
+            name: tc.function.name,
+            arguments: tc.function.arguments
+          }
+        }));
+        session.messages.push(assistantMsg);
+
+        for (const tc of accumulator.toolCalls) {
+          session.messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({
+              error: 'Tool execution truncated due to token limits. Do not execute partial command; please simplify or break down your request.'
+            })
+          });
+        }
+
+        sendNotification('session/update', {
+          sessionId,
+          delta: {
+            type: 'text',
+            text: '\n\n*(Notice: Output reached max token length. Incomplete tool parameters have been safeguarded.)*'
+          }
+        });
+
+        // Let model self-correct on next turn iteration
+        continue;
+      }
+
+      const validToolCalls: ToolCall[] = accumulator.getValidToolCalls();
+
+      // No tool calls means the model produced its final response text
+      if (validToolCalls.length === 0) {
+        session.messages.push(assistantMsg);
+        session.commit();
+        turnCompleted = true;
+
+        sendResponse(id, {
+          sessionId,
+          message: {
+            role: 'assistant',
+            content: accumulator.content || ''
+          },
+          stopReason: 'end_turn'
+        });
+        sendNotification('session/turnComplete', { sessionId });
+        return;
+      }
+
+      // Tool calls were produced
+      assistantMsg.tool_calls = validToolCalls;
+      session.messages.push(assistantMsg);
+
+      let loopAborted = false;
+      const executedToolCallIds = new Set<string>();
+
+      // Tool Execution & Circuit Breaker: Abort if 2 identical tool errors occur in a row.
+      for (const tc of validToolCalls) {
+        let parsedArgs: Record<string, unknown> = {};
+        try {
+          parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
+        } catch (parseErr: unknown) {
+          const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+          console.warn(`JSON parse error on tool arguments for ${tc.function.name}: ${msg}`);
+          const errorMsg = `Tool execution truncated due to token limits: malformed JSON arguments (${msg})`;
+          session.messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            content: JSON.stringify({ error: errorMsg })
+          });
+          executedToolCallIds.add(tc.id);
+
+          if (lastToolError === errorMsg) {
+            consecutiveErrorCount++;
+          } else {
+            lastToolError = errorMsg;
+            consecutiveErrorCount = 1;
+          }
+
+          if (consecutiveErrorCount >= 2) {
+            console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${tc.function.name}'.`);
+            sendNotification('session/update', {
+              sessionId,
+              delta: {
+                type: 'text',
+                text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${lastToolError})*`
+              }
+            });
+            loopAborted = true;
+            break;
+          }
+          continue;
+        }
+
+        const argsPreview = JSON.stringify(parsedArgs).slice(0, 150);
+        console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
+        const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
+        console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
+
+        session.messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: toolResult
+        });
+        executedToolCallIds.add(tc.id);
+
+        // Check if output represents a tool error
+        let errorString: string | null = null;
+        try {
+          const parsedOut = JSON.parse(toolResult) as { error?: unknown };
+          if (parsedOut && parsedOut.error) {
+            errorString = typeof parsedOut.error === 'string' ? parsedOut.error : JSON.stringify(parsedOut.error);
+          }
+        } catch {
+          // Ignored
+        }
+
+        if (errorString) {
+          if (lastToolError === errorString) {
+            consecutiveErrorCount++;
+          } else {
+            lastToolError = errorString;
+            consecutiveErrorCount = 1;
+          }
+        } else {
+          lastToolError = null;
+          consecutiveErrorCount = 0;
+        }
+
+        // Circuit breaker: Abort if 2 identical tool errors occur in a row
+        if (consecutiveErrorCount >= 2) {
+          console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${tc.function.name}'.`);
+          sendNotification('session/update', {
+            sessionId,
+            delta: {
+              type: 'text',
+              text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${lastToolError})*`
+            }
+          });
+          loopAborted = true;
+          break;
+        }
+      }
+
+      if (loopAborted) {
+        // Ensure any remaining unexecuted tool calls have synthetic error responses injected
+        for (const tc of validToolCalls) {
+          if (!executedToolCallIds.has(tc.id)) {
+            session.messages.push({
+              role: 'tool',
+              tool_call_id: tc.id,
+              content: JSON.stringify({
+                error: 'Tool execution aborted: circuit breaker stopped execution before this tool could run.'
+              })
+            });
+            executedToolCallIds.add(tc.id);
+          }
+        }
+        console.warn(`Circuit breaker triggered for session ${sessionId}. Ending turn.`);
+        break;
+      }
+    }
+
+    if (!turnCompleted) {
+      session.commit();
+      const finalContent = iteration >= maxIterations
+        ? (session.messages[session.messages.length - 1]?.content ?? 'Turn reached maximum iteration limit.')
+        : 'Turn execution stopped because repetitive tool errors occurred.';
+      sendResponse(id, {
+        sessionId,
+        message: {
+          role: 'assistant',
+          content: finalContent
+        },
+        stopReason: iteration >= maxIterations ? 'max_iterations' : 'loop_aborted'
+      });
+      sendNotification('session/turnComplete', { sessionId });
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Turn execution error in session ${sessionId}: ${msg}`);
+
+    // Rollback session state on error
+    session.rollback();
+
+    sendNotification('session/update', {
+      sessionId,
+      delta: {
+        type: 'text',
+        text: `⚠️ **DeepSeek Agent Notice:** Encountered an error during processing: ${msg}. Conversation state has been restored to last stable checkpoint.`
+      }
+    });
+
+    sendResponse(id, {
+      sessionId,
+      message: {
+        role: 'assistant',
+        content: `Error: ${msg}`
+      },
+      stopReason: 'error'
+    });
+    sendNotification('session/turnComplete', { sessionId });
+  } finally {
+    session.abortController = null;
+    session.activePromptId = null;
+  }
+}
+
+// ============================================================================
+// 6. PROCESS STDIN LISTENER
+// ============================================================================
+const rl = readline.createInterface({
+  input: process.stdin,
+  terminal: false
+});
+
+rl.on('line', (line: string) => {
+  const trimmed = line.trim();
+  if (!trimmed) {
+    return;
+  }
+  try {
+    const rpc = JSON.parse(trimmed) as JSONRPCRequest;
+    handleRpcMessage(rpc);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`Invalid JSON-RPC frame: ${msg}`);
+  }
+});
+
+rl.on('close', async () => {
+  console.info('Stdin closed. Shutting down adapter...');
+  await mcpClient.close();
+  process.exit(0);
+});
+
+// Handle graceful termination signals
+process.on('SIGTERM', async () => {
+  console.info('Received SIGTERM, closing...');
+  await mcpClient.close();
+  process.exit(0);
+});
+
+process.on('SIGINT', async () => {
+  console.info('Received SIGINT, closing...');
+  await mcpClient.close();
+  process.exit(0);
+});

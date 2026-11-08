@@ -1,0 +1,67 @@
+{
+  "name": "deepseek-agent-acp",
+  "version": "0.1.0",
+  "description": "Agent Client Protocol (ACP) adapter for DeepSeek reasoning and chat models with Model Context Protocol (MCP) tool execution",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "deepseek-agent-acp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src tests",
+    "lint:fix": "eslint src tests --fix",
+    "test": "node --test tests/test_sse_parser.test.mjs tests/test_deepseek_acp.test.mjs",
+    "start": "node dist/index.js",
+    "prepare": "husky",
+    "prepublishOnly": "npm run typecheck && npm run lint && npm run test && npm run build"
+  },
+  "lint-staged": {
+    "*.ts": [
+      "eslint --fix"
+    ]
+  },
+  "keywords": [
+    "acp",
+    "agent-client-protocol",
+    "deepseek",
+    "deepseek-r1",
+    "deepseek-v3",
+    "ai-agents",
+    "agentic-ai",
+    "mcp",
+    "model-context-protocol"
+  ],
+  "author": "Dong Tran",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dongitran/deepseek-agent-acp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/dongitran/deepseek-agent-acp/issues"
+  },
+  "homepage": "https://github.com/dongitran/deepseek-agent-acp#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@typescript-eslint/eslint-plugin": "^8.26.0",
+    "@typescript-eslint/parser": "^8.26.0",
+    "eslint": "^9.21.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^15.4.3",
+    "typescript": "^5.7.3"
+  }
+}
