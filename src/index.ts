@@ -173,6 +173,7 @@ class Session {
   public checkpoint: ChatMessage[];
   public abortController: AbortController | null = null;
   public activePromptId: string | number | null = null;
+  public activeTurnHandle: TurnSpanHandle | null = null;
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
@@ -254,6 +255,11 @@ async function handleRpcMessage(rpc: JSONRPCRequest): Promise<void> {
             streaming: true,
             tools: true,
             sessionCancellation: true
+          },
+          _meta: {
+            steering: {
+              supported: true
+            }
           }
         });
         break;
@@ -280,6 +286,11 @@ async function handleRpcMessage(rpc: JSONRPCRequest): Promise<void> {
 
       case 'session/prompt': {
         await handleSessionPrompt(id, params);
+        break;
+      }
+
+      case '_session/steering': {
+        handleSessionSteering(id, params);
         break;
       }
 
@@ -385,6 +396,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
     MODEL,
     nostrMeta
   );
+  session.activeTurnHandle = turnHandle ?? null;
 
   const maxIterations = getIterationLimit(MODEL);
   let iteration = 0;
@@ -746,7 +758,47 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
   } finally {
     session.abortController = null;
     session.activePromptId = null;
+    session.activeTurnHandle = null;
   }
+}
+
+/**
+ * Handle ACP _session/steering requests (mid-turn follow-up injection).
+ */
+function handleSessionSteering(id?: string | number, params?: Record<string, unknown>): void {
+  const sessionId = (params?.sessionId as string) || '';
+  const session = sessionId ? sessions.get(sessionId) : undefined;
+  const promptText = extractPromptText(params);
+
+  if (!session || !session.activePromptId) {
+    // Session is idle or has no running turn
+    sendResponse(id, {
+      outcome: 'promptRequired',
+      reason: 'noRunningTurn'
+    });
+    return;
+  }
+
+  // Active turn in flight: parse nostr context and record steer child span
+  const nostrMeta = parseNostrContext(promptText);
+  if (session.activeTurnHandle) {
+    session.activeTurnHandle.recordSteerSpan({
+      eventId: nostrMeta.eventId,
+      text: promptText,
+      senderName: nostrMeta.senderName,
+      senderPubkey: nostrMeta.senderPubkey,
+      priority: 'now'
+    });
+  }
+
+  // Inject into active turn messages for the model's next iteration
+  const steerHeader = '[New message — arrived while you were working]';
+  const steerFormatted = `${steerHeader}\n${promptText}`;
+  session.messages.push({ role: 'user', content: steerFormatted });
+
+  console.info(`[STEER] Injected steered message into active session ${sessionId} (event: ${nostrMeta.eventId ?? 'unknown'})`);
+
+  sendResponse(id, { outcome: 'injected' });
 }
 
 // ============================================================================

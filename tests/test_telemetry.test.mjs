@@ -120,18 +120,38 @@ test('parseNostrContext: non-string inputs (array, object, null, undefined) safe
   assert.deepEqual(parseNostrContext(12345), {});
 });
 
-test('extractPostedEventId: extracts 64-hex ID from buzz-thread reply tool output', () => {
+test('extractPostedEventId: extracts 64-hex ID across reply, shell json, and assignment formats', () => {
+  // 1. buzz-thread reply format (space-separated)
   const replyOutput = 'posted (128 characters) · event_id 40738780fa35899d341c45daeda99e609aff92c6d3cb44c54e06e7290e7bb38b';
-  const extracted = extractPostedEventId(replyOutput);
-  assert.equal(extracted, '40738780fa35899d341c45daeda99e609aff92c6d3cb44c54e06e7290e7bb38b');
+  assert.equal(extractPostedEventId(replyOutput), '40738780fa35899d341c45daeda99e609aff92c6d3cb44c54e06e7290e7bb38b');
 
-  const jsonReply = JSON.stringify({
-    text: 'posted (50 characters) · event_id 2d07f7bcfe20c770b7ac19dba3e5b5acb8cd3f275342f49c7e2dfa9cff4f33f0'
-  });
-  assert.equal(extractPostedEventId(jsonReply), '2d07f7bcfe20c770b7ac19dba3e5b5acb8cd3f275342f49c7e2dfa9cff4f33f0');
+  // 2. shell output running `buzz messages send` (raw JSON)
+  const shellJsonOutput = '{"accepted":true,"event_id":"5c428ab9b6b608a6214d61412d099613bc8ce200d3afecd91a4523754cdc6142","mention_pubkeys":[]}';
+  assert.equal(extractPostedEventId(shellJsonOutput), '5c428ab9b6b608a6214d61412d099613bc8ce200d3afecd91a4523754cdc6142');
 
+  // 3. Object representation
+  const objOutput = {
+    accepted: true,
+    event_id: '5c428ab9b6b608a6214d61412d099613bc8ce200d3afecd91a4523754cdc6142'
+  };
+  assert.equal(extractPostedEventId(objOutput), '5c428ab9b6b608a6214d61412d099613bc8ce200d3afecd91a4523754cdc6142');
+
+  // 4. Colon separated
+  assert.equal(
+    extractPostedEventId('event_id: aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd'),
+    'aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd'
+  );
+
+  // 5. Equal separated
+  assert.equal(
+    extractPostedEventId('event_id="aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd"'),
+    'aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd'
+  );
+
+  // 6. Invalid / absent
   const failedReply = 'error: unable to publish event';
   assert.equal(extractPostedEventId(failedReply), undefined);
+  assert.equal(extractPostedEventId('event_id: invalid_hex'), undefined);
 });
 
 test('StreamAccumulator: captures usage metrics even when choices array is empty', () => {

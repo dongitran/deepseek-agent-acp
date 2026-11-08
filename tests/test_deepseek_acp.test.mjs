@@ -79,6 +79,7 @@ test('ACP initialize returns protocolVersion 1 and capabilities', async () => {
     assert.equal(res.result.agentInfo.name, 'deepseek-agent-acp');
     assert.equal(res.result.capabilities.streaming, true);
     assert.equal(res.result.capabilities.tools, true);
+    assert.equal(res.result._meta?.steering?.supported, true);
   } finally {
     child.kill();
   }
@@ -568,6 +569,114 @@ test('CoT Invariant unconditionally preserves reasoning_content regardless of mo
       (m) => m.role === 'assistant' && m.reasoning_content === 'Step 1: thinking thoroughly...'
     );
     assert.ok(assistantMsg, 'Expected reasoning_content to be unconditionally preserved in assistant message');
+  } finally {
+    child.kill();
+    server.close();
+  }
+});
+
+test('ACP _session/steering returns promptRequired when session is idle', async () => {
+  const { child, send, waitResponse } = spawnAdapter();
+  try {
+    send({
+      jsonrpc: '2.0',
+      id: 60,
+      method: '_session/steering',
+      params: { sessionId: 'idle-test-sess', prompt: 'Mid-turn steer message' }
+    });
+    const res = await waitResponse(60);
+    assert.equal(res.id, 60);
+    assert.equal(res.result.outcome, 'promptRequired');
+    assert.equal(res.result.reason, 'noRunningTurn');
+  } finally {
+    child.kill();
+  }
+});
+
+test('ACP _session/steering injects follow-up into running turn', async () => {
+  let callCount = 0;
+  const receivedBodies = [];
+
+  const server = http.createServer((req, res) => {
+    if (req.url === '/chat/completions') {
+      let body = '';
+      req.on('data', (c) => { body += c; });
+      req.on('end', () => {
+        callCount++;
+        receivedBodies.push(JSON.parse(body));
+
+        if (callCount === 1) {
+          // Simulate tool call with delay to allow mid-turn steering injection
+          setTimeout(() => {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive'
+            });
+            res.write('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"shell","arguments":"{\\"command\\":\\"echo test\\"}"}}]}}]}\n\n');
+            res.write('data: [DONE]\n\n');
+            res.end();
+          }, 300);
+        } else {
+          // Final reply acknowledging steer
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive'
+          });
+          res.write('data: {"choices":[{"delta":{"content":"Steered reply completed."}}]}\n\n');
+          res.write('data: [DONE]\n\n');
+          res.end();
+        }
+      });
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const port = server.address().port;
+  const mockBaseUrl = `http://127.0.0.1:${port}`;
+
+  const { child, send, waitResponse } = spawnAdapter({
+    DEEPSEEK_BASE_URL: mockBaseUrl
+  });
+
+  try {
+    // 1. Send initial prompt
+    send({
+      jsonrpc: '2.0',
+      id: 70,
+      method: 'session/prompt',
+      params: { sessionId: 'steer-active-sess', prompt: 'Initial prompt text' }
+    });
+
+    // 2. Wait 50ms so prompt turn starts, then send mid-turn steer
+    await new Promise((r) => setTimeout(r, 50));
+    send({
+      jsonrpc: '2.0',
+      id: 71,
+      method: '_session/steering',
+      params: { sessionId: 'steer-active-sess', prompt: 'Urgent steer directive' }
+    });
+
+    // 3. Steer response must arrive with injected outcome
+    const steerRes = await waitResponse(71, 3000);
+    assert.equal(steerRes.id, 71);
+    assert.equal(steerRes.result.outcome, 'injected');
+
+    // 4. Initial prompt turn completes
+    const promptRes = await waitResponse(70, 5000);
+    assert.equal(promptRes.id, 70);
+
+    // 5. Verify the second call to DeepSeek included the injected steered message
+    assert.ok(receivedBodies.length >= 2, 'Expected at least 2 chat completion calls');
+    const secondCallMessages = receivedBodies[1].messages;
+    const hasSteeredMessage = secondCallMessages.some(
+      (m) => m.role === 'user' && m.content.includes('Urgent steer directive')
+    );
+    assert.ok(hasSteeredMessage, 'Expected second call messages to include injected steer directive');
   } finally {
     child.kill();
     server.close();

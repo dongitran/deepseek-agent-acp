@@ -233,8 +233,15 @@ export function parseNostrContext(rawText: unknown): NostrMetadata {
 }
 
 /**
- * Extract the posted Buzz event ID from a reply tool result.
- * buzz-thread reply tools return `posted (N characters) · event_id <64 hex>`.
+ * Regex matching posted Nostr event ID across text and JSON formats:
+ * - buzz messages send / relay stdout: {"accepted":true,"event_id":"<64 hex>",...}
+ * - reply tools: `posted (N characters) · event_id <64 hex>`
+ * - shell assignments: `event_id=<64 hex>` or `event_id: <64 hex>`
+ */
+export const POSTED_OUTPUT_PATTERN = /\bevent_id["']?\s*[:=]?\s*["']?([0-9a-f]{64})(?![0-9a-f])/i;
+
+/**
+ * Extract the posted Buzz event ID from a reply tool result or shell output.
  */
 export function extractPostedEventId(output: unknown): string | undefined {
   let text = '';
@@ -246,12 +253,8 @@ export function extractPostedEventId(output: unknown): string | undefined {
   if (!text) {
     return undefined;
   }
-  const match = /\bevent_id\s+([0-9a-f]{64})\b/i.exec(text.slice(0, 4096));
+  const match = POSTED_OUTPUT_PATTERN.exec(text.slice(0, 8192));
   return match?.[1] ? match[1].toLowerCase() : undefined;
-}
-
-function isReplyTool(toolName: string): boolean {
-  return toolName === 'mcp__buzz-thread__reply' || toolName === 'reply' || toolName.endsWith('reply');
 }
 
 // ============================================================================
@@ -263,10 +266,19 @@ export interface LlmSpanHandle {
   end(outputValue?: string, errorMessage?: string): void;
 }
 
+export interface SteerSpanParams {
+  eventId?: string;
+  text: string;
+  senderName?: string;
+  senderPubkey?: string;
+  priority?: 'now' | 'later';
+}
+
 export interface TurnSpanHandle {
   startLlmSpan(modelName: string, iteration?: number): LlmSpanHandle;
   startToolSpan(toolCallId: string, toolName: string, toolParams: unknown): void;
   endToolSpan(toolCallId: string, output?: unknown, isError?: boolean, toolName?: string): void;
+  recordSteerSpan(params: SteerSpanParams): void;
   recordUsage(usage: DeepSeekUsage): void;
   end(
     status: 'OK' | 'ERROR' | 'CANCELLED',
@@ -539,12 +551,12 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
               }
               return;
             }
-            const { span: toolSpan, toolName: resolvedToolName } = entry;
+            const { span: toolSpan } = entry;
             const outputBytes = computeOutputBytes(output);
             toolSpan.setAttribute('tool.output_bytes', outputBytes);
 
-            // Extract posted_event_id for reply tools
-            if (!isError && isReplyTool(resolvedToolName)) {
+            // Extract posted_event_id for any posting tool (reply, buzz-thread__reply, shell, etc.)
+            if (!isError) {
               const postedId = extractPostedEventId(output);
               if (postedId) {
                 toolSpan.setAttribute('nostr.posted_event_id', postedId);
@@ -570,6 +582,35 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
 
             toolSpan.end();
             activeToolSpans.delete(toolCallId);
+          },
+
+          recordSteerSpan(steerParams: SteerSpanParams): void {
+            const sanitizedText = truncatePayload(redactSecrets(steerParams.text), 8192);
+            const steerSpan = tracer.startSpan('steer', {
+              attributes: {
+                'openinference.span.kind': 'CHAIN',
+                'session.id': resolvedSessionId,
+                ...(steerParams.eventId ? { 'nostr.event_id': steerParams.eventId.toLowerCase() } : {}),
+                'input.value': sanitizedText,
+                'input.mime_type': 'text/plain',
+                ...(steerParams.senderName ? { 'nostr.sender_name': steerParams.senderName } : {}),
+                ...(steerParams.senderPubkey ? { 'nostr.sender_pubkey': steerParams.senderPubkey.toLowerCase() } : {}),
+                'steer.priority': steerParams.priority ?? 'now',
+                'steer.delivered': true,
+                'steer.end_reason': 'echo'
+              }
+            }, rootContext);
+
+            steerSpan.setStatus({ code: SpanStatusCode.OK });
+            steerSpan.end();
+
+            rootSpan.addEvent('steer', {
+              ...(steerParams.eventId ? { 'nostr.event_id': steerParams.eventId.toLowerCase() } : {}),
+              'input.value': sanitizedText,
+              ...(steerParams.senderName ? { 'nostr.sender_name': steerParams.senderName } : {}),
+              'steer.priority': steerParams.priority ?? 'now',
+              'steer.delivered': true
+            });
           },
 
           recordUsage(usage: DeepSeekUsage): void {
