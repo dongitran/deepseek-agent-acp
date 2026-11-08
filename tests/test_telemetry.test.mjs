@@ -148,7 +148,25 @@ test('extractPostedEventId: extracts 64-hex ID across reply, shell json, and ass
     'aabbccdd00112233445566778899aabbccdd00112233445566778899aabbccdd'
   );
 
-  // 6. Invalid / absent
+  // 6. MCP tool output containing escaped JSON string in stdout
+  const mcpWrappedOutput = '{"duration_ms":1852,"exit_code":0,"stdout":"{\\"accepted\\":true,\\"event_id\\":\\"43b6866230ea40328fb176a24978a6417a793f5c01182b6437bc5dc6059e1e6c\\"}\\n"}';
+  assert.equal(
+    extractPostedEventId(mcpWrappedOutput),
+    '43b6866230ea40328fb176a24978a6417a793f5c01182b6437bc5dc6059e1e6c'
+  );
+
+  // 7. MCP parsed object containing stdout with JSON
+  const mcpObjOutput = {
+    duration_ms: 1852,
+    exit_code: 0,
+    stdout: '{"accepted":true,"event_id":"43b6866230ea40328fb176a24978a6417a793f5c01182b6437bc5dc6059e1e6c"}'
+  };
+  assert.equal(
+    extractPostedEventId(mcpObjOutput),
+    '43b6866230ea40328fb176a24978a6417a793f5c01182b6437bc5dc6059e1e6c'
+  );
+
+  // 8. Invalid / absent
   const failedReply = 'error: unable to publish event';
   assert.equal(extractPostedEventId(failedReply), undefined);
   assert.equal(extractPostedEventId('event_id: invalid_hex'), undefined);

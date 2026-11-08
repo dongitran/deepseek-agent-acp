@@ -233,12 +233,14 @@ export function parseNostrContext(rawText: unknown): NostrMetadata {
 }
 
 /**
- * Regex matching posted Nostr event ID across text and JSON formats:
+ * Regex matching posted Nostr event ID across text, JSON, and escaped JSON formats:
  * - buzz messages send / relay stdout: {"accepted":true,"event_id":"<64 hex>",...}
+ * - escaped JSON stdout: {\"accepted\":true,\"event_id\":\"<64 hex>\"}
  * - reply tools: `posted (N characters) · event_id <64 hex>`
  * - shell assignments: `event_id=<64 hex>` or `event_id: <64 hex>`
  */
-export const POSTED_OUTPUT_PATTERN = /\bevent_id["']?\s*[:=]?\s*["']?([0-9a-f]{64})(?![0-9a-f])/i;
+export const POSTED_OUTPUT_PATTERN =
+  /\bevent_id\\?["']?\s*[:=]?\s*\\?["']?([0-9a-f]{64})(?![0-9a-f])/i;
 
 /**
  * Extract the posted Buzz event ID from a reply tool result or shell output.
@@ -247,8 +249,20 @@ export function extractPostedEventId(output: unknown): string | undefined {
   let text = '';
   if (typeof output === 'string') {
     text = output;
+    try {
+      const parsed = JSON.parse(output) as Record<string, unknown>;
+      if (parsed && typeof parsed.stdout === 'string') {
+        text += ` ${parsed.stdout}`;
+      }
+    } catch {
+      // Ignored
+    }
   } else if (output && typeof output === 'object') {
+    const rec = output as Record<string, unknown>;
     text = JSON.stringify(output);
+    if (typeof rec.stdout === 'string') {
+      text += ` ${rec.stdout}`;
+    }
   }
   if (!text) {
     return undefined;
@@ -419,7 +433,16 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
         modelName?: string,
         nostrMeta?: NostrMetadata
       ): TurnSpanHandle {
-        const sanitizedPrompt = truncatePayload(redactSecrets(promptText), 8192);
+        // Extract the event message block if present for cleaner prompt preview in Phoenix & buzz-trace
+        let promptForSpan = promptText;
+        if (promptText.includes('\n') && promptText.includes('Event ID:')) {
+          const blocks = promptText.split(/\n{2,}/);
+          const eventBlock = blocks.find((b) => b.includes('Event ID:'));
+          if (eventBlock) {
+            promptForSpan = eventBlock;
+          }
+        }
+        const sanitizedPrompt = truncatePayload(redactSecrets(promptForSpan), 8192);
         const resolvedSessionId = nostrMeta?.threadRootId ?? sessionId;
 
         const rootSpan = tracer.startSpan('agent_turn', {
@@ -556,15 +579,23 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
             toolSpan.setAttribute('tool.output_bytes', outputBytes);
 
             // Extract posted_event_id for any posting tool (reply, buzz-thread__reply, shell, etc.)
+            let hasPostedId = false;
             if (!isError) {
               const postedId = extractPostedEventId(output);
               if (postedId) {
+                hasPostedId = true;
                 toolSpan.setAttribute('nostr.posted_event_id', postedId);
                 rootSpan.setAttribute('nostr.posted_event_id', postedId);
+                // Ensure output.value and tool.output are captured on the posting span for trace fidelity
+                const rawStr = typeof output === 'string' ? output : JSON.stringify(output);
+                const sanitizedOut = truncatePayload(redactSecrets(rawStr), 8192);
+                toolSpan.setAttribute('output.value', sanitizedOut);
+                toolSpan.setAttribute('tool.output', sanitizedOut);
+                toolSpan.setAttribute('output.mime_type', 'text/plain');
               }
             }
 
-            if (process.env.OTEL_CAPTURE_TOOL_OUTPUT === 'true' && output !== undefined) {
+            if (process.env.OTEL_CAPTURE_TOOL_OUTPUT === 'true' && output !== undefined && !hasPostedId) {
               const sanitizedOut = truncatePayload(redactSecrets(output), 8192);
               toolSpan.setAttribute('output.value', sanitizedOut);
               toolSpan.setAttribute('output.mime_type', 'text/plain');
