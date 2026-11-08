@@ -79,8 +79,9 @@ export function loadSecretKey(secretsPath = '/run/agent-secrets/env'): string {
   delete process.env.DEEPSEEK_AUTH_TOKEN;
   delete process.env.DEEPSEEK_TOKEN;
   delete process.env.DEEPSEEK_SECRET;
+  const preservedDeepseekConfig = new Set(['DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TEMPERATURE']);
   for (const envKey of Object.keys(process.env)) {
-    if (/^DEEPSEEK_.*(KEY|TOKEN|SECRET)/i.test(envKey)) {
+    if (/^DEEPSEEK_/i.test(envKey) && !preservedDeepseekConfig.has(envKey)) {
       delete process.env[envKey];
     }
   }
@@ -593,7 +594,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
               role: 'tool',
               tool_call_id: tc.id,
               content: JSON.stringify({
-                error: 'Tool execution aborted: circuit breaker stopped execution before this tool could run.'
+                error: 'Tool execution aborted: loop breaker stopped execution before this tool could run. (circuit breaker stopped execution before this tool could run)'
               })
             });
             executedToolCallIds.add(tc.id);
