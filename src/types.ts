@@ -42,12 +42,27 @@ export interface SSEChoice {
   finish_reason?: 'stop' | 'tool_calls' | 'length' | null;
 }
 
+export interface DeepSeekUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_cache_hit_tokens?: number;
+  prompt_cache_miss_tokens?: number;
+  prompt_tokens_details?: {
+    cached_tokens?: number;
+  };
+  completion_tokens_details?: {
+    reasoning_tokens?: number;
+  };
+}
+
 export interface SSEChunkData {
   id?: string;
   object?: string;
   created?: number;
   model?: string;
   choices: SSEChoice[];
+  usage?: DeepSeekUsage;
 }
 
 export interface SSEEvent {
@@ -81,6 +96,7 @@ export interface StreamYieldEvent {
     content: string;
     toolCalls: ToolCall[];
     finishReason: string | null;
+    usage: DeepSeekUsage | null;
     isTruncated: () => boolean;
     getValidToolCalls: () => ToolCall[];
   };

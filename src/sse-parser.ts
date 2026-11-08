@@ -11,7 +11,8 @@ import type {
   SSEChunkData,
   ProcessedChunkResult,
   ToolCall,
-  StreamYieldEvent
+  StreamYieldEvent,
+  DeepSeekUsage
 } from './types.js';
 
 export class SSEParser {
@@ -67,11 +68,16 @@ export class StreamAccumulator {
   public content = '';
   public toolCalls: ToolCall[] = [];
   public finishReason: string | null = null;
+  public usage: DeepSeekUsage | null = null;
 
   /**
    * Process a parsed SSE chunk data object.
    */
   processChunk(chunkData?: SSEChunkData): ProcessedChunkResult {
+    if (chunkData?.usage) {
+      this.usage = chunkData.usage;
+    }
+
     if (!chunkData?.choices || !Array.isArray(chunkData.choices) || chunkData.choices.length === 0) {
       return {
         reasoningDelta: null,
