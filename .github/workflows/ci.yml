@@ -94,8 +94,20 @@ jobs:
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Check whether NPM_TOKEN is configured
+        id: token_check
+        run: |
+          if [ -n "${NODE_AUTH_TOKEN}" ]; then
+            echo "has_token=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_token=false" >> "$GITHUB_OUTPUT"
+            echo "NPM_TOKEN secret is not set in repository secrets. Skipping npm publish."
+          fi
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
       - name: Publish
-        if: steps.publish_check.outputs.should_publish == 'true'
+        if: steps.publish_check.outputs.should_publish == 'true' && steps.token_check.outputs.has_token == 'true'
         run: npm publish --provenance --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

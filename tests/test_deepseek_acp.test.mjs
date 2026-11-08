@@ -31,7 +31,9 @@ function spawnAdapter(env = {}) {
     while ((newlineIdx = buffer.indexOf('\n')) !== -1) {
       const line = buffer.slice(0, newlineIdx).trim();
       buffer = buffer.slice(newlineIdx + 1);
-      if (!line) continue;
+      if (!line) {
+        continue;
+      }
       try {
         const msg = JSON.parse(line);
         if (msg.id !== undefined && msg.id !== null) {

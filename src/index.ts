@@ -13,6 +13,7 @@
 
 import fs from 'node:fs';
 import readline from 'node:readline';
+import { format } from 'node:util';
 import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
 import { McpClient } from './mcp-client.js';
 import type {
@@ -33,18 +34,15 @@ const originalStderrWrite = process.stderr.write.bind(process.stderr);
 
 // eslint-disable-next-line no-console
 console.log = (...args: unknown[]) => {
-  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
-  originalStderrWrite(`[deepseek-acp:INFO] ${msg}\n`);
+  originalStderrWrite(`[deepseek-acp:INFO] ${format(...args)}\n`);
 };
 // eslint-disable-next-line no-console
 console.info = console.log;
 console.warn = (...args: unknown[]) => {
-  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
-  originalStderrWrite(`[deepseek-acp:WARN] ${msg}\n`);
+  originalStderrWrite(`[deepseek-acp:WARN] ${format(...args)}\n`);
 };
 console.error = (...args: unknown[]) => {
-  const msg = args.map((a) => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ');
-  originalStderrWrite(`[deepseek-acp:ERROR] ${msg}\n`);
+  originalStderrWrite(`[deepseek-acp:ERROR] ${format(...args)}\n`);
 };
 
 // ============================================================================
@@ -80,7 +78,12 @@ export function loadSecretKey(secretsPath = '/run/agent-secrets/env'): string {
   delete process.env.DEEPSEEK_API_KEY;
   delete process.env.DEEPSEEK_AUTH_TOKEN;
   delete process.env.DEEPSEEK_TOKEN;
-  delete process.env.DEEPSEEK_ELIO;
+  delete process.env.DEEPSEEK_SECRET;
+  for (const envKey of Object.keys(process.env)) {
+    if (/^DEEPSEEK_.*(KEY|TOKEN|SECRET)/i.test(envKey)) {
+      delete process.env[envKey];
+    }
+  }
 
   return key;
 }
@@ -195,7 +198,7 @@ mcpClient.init().catch((err: unknown) => {
 });
 
 function sendRpc(obj: JSONRPCRequest | JSONRPCResponse | JSONRPCNotification): void {
-  originalStdoutWrite(JSON.stringify(obj) + '\n');
+  originalStdoutWrite(`${JSON.stringify(obj)}\n`);
 }
 
 function sendResponse(id?: string | number, result?: unknown, error?: { code: number; message: string; data?: unknown }): void {
@@ -661,28 +664,38 @@ rl.on('line', (line: string) => {
   }
   try {
     const rpc = JSON.parse(trimmed) as JSONRPCRequest;
-    handleRpcMessage(rpc);
+    void handleRpcMessage(rpc);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Invalid JSON-RPC frame: ${msg}`);
   }
 });
 
-rl.on('close', async () => {
-  console.info('Stdin closed. Shutting down adapter...');
-  await mcpClient.close();
-  process.exit(0);
+const shutdown = (signal?: string): void => {
+  if (signal) {
+    console.info(`Received ${signal}, closing...`);
+  } else {
+    console.info('Stdin closed. Shutting down adapter...');
+  }
+  mcpClient
+    .close()
+    .catch((err: unknown) => {
+      console.error('Error during shutdown:', err);
+    })
+    .finally(() => {
+      process.exit(0);
+    });
+};
+
+rl.on('close', () => {
+  shutdown();
 });
 
 // Handle graceful termination signals
-process.on('SIGTERM', async () => {
-  console.info('Received SIGTERM, closing...');
-  await mcpClient.close();
-  process.exit(0);
+process.on('SIGTERM', () => {
+  shutdown('SIGTERM');
 });
 
-process.on('SIGINT', async () => {
-  console.info('Received SIGINT, closing...');
-  await mcpClient.close();
-  process.exit(0);
+process.on('SIGINT', () => {
+  shutdown('SIGINT');
 });

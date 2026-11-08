@@ -6,7 +6,53 @@ export default [
     ignores: ['dist/**', 'node_modules/**', 'coverage/**', '*.tgz'],
   },
   {
-    files: ['src/**/*.ts', 'tests/**/*.ts'],
+    files: ['src/**/*.ts'],
+    languageOptions: {
+      parser: tsParser,
+      parserOptions: {
+        ecmaVersion: 'latest',
+        sourceType: 'module',
+        project: './tsconfig.json',
+        tsconfigRootDir: import.meta.dirname,
+      },
+    },
+    plugins: {
+      '@typescript-eslint': tsPlugin,
+    },
+    rules: {
+      ...tsPlugin.configs.recommended.rules,
+      ...tsPlugin.configs['recommended-requiring-type-checking']?.rules,
+      '@typescript-eslint/no-explicit-any': 'error',
+      '@typescript-eslint/no-unused-vars': [
+        'error',
+        {
+          argsIgnorePattern: '^_',
+          varsIgnorePattern: '^_',
+        },
+      ],
+      '@typescript-eslint/consistent-type-imports': [
+        'error',
+        { prefer: 'type-imports', fixStyle: 'inline-type-imports' },
+      ],
+      '@typescript-eslint/no-floating-promises': 'error',
+      '@typescript-eslint/no-misused-promises': 'error',
+      '@typescript-eslint/await-thenable': 'error',
+      '@typescript-eslint/require-await': 'error',
+      '@typescript-eslint/no-unnecessary-type-assertion': 'error',
+      '@typescript-eslint/no-shadow': 'error',
+      'no-shadow': 'off',
+      'no-console': ['error', { allow: ['error', 'warn', 'info'] }],
+      'eqeqeq': ['error', 'always'],
+      'no-var': 'error',
+      'prefer-const': 'error',
+      'curly': ['error', 'all'],
+      'prefer-template': 'error',
+      'no-useless-concat': 'error',
+      'no-duplicate-imports': 'error',
+    },
+  },
+  {
+    files: ['tests/**/*.ts', 'tests/**/*.mjs', '*.js'],
     languageOptions: {
       parser: tsParser,
       parserOptions: {
@@ -18,29 +64,12 @@ export default [
       '@typescript-eslint': tsPlugin,
     },
     rules: {
-      ...tsPlugin.configs.recommended.rules,
-      '@typescript-eslint/no-explicit-any': 'error',
-      '@typescript-eslint/no-unused-vars': [
-        'error',
-        {
-          argsIgnorePattern: '^_',
-          varsIgnorePattern: '^_',
-        },
-      ],
-      '@typescript-eslint/explicit-function-return-type': 'off',
-      '@typescript-eslint/no-non-null-assertion': 'warn',
-      'no-console': ['error', { allow: ['error', 'warn', 'info'] }],
-      'eqeqeq': ['error', 'always'],
+      '@typescript-eslint/no-explicit-any': 'off',
+      'no-console': 'off',
       'no-var': 'error',
       'prefer-const': 'error',
       'curly': ['error', 'all'],
     },
   },
-  {
-    files: ['tests/**/*.ts', 'tests/**/*.mjs'],
-    rules: {
-      '@typescript-eslint/no-explicit-any': 'off',
-      'no-console': 'off',
-    },
-  },
 ];
+
