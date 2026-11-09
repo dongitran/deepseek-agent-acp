@@ -117,7 +117,7 @@ export function describeReasoning(params: ReasoningRequestParams): string {
 // ============================================================================
 
 /** Strict positive decimal integer; rejects "10abc", "1.5", "1e3", "0" and "-5" that parseInt would half-accept. */
-function parsePositiveInt(raw: string): number | null {
+export function parsePositiveInt(raw: string): number | null {
   if (!/^[1-9]\d*$/.test(raw)) {
     return null;
   }

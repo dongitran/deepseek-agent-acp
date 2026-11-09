@@ -5,19 +5,28 @@
  * - LLM child spans (llm:<model>) per iteration tracking streaming deltas & token usage.
  * - TOOL child spans (tool:<name>) for MCP tool execution with duration, output bytes, and status.
  * - Special extraction of `nostr.posted_event_id` for buzz-trace topological thread linking.
- * - Two-tier secret redaction (32KB pre-truncation, exact-match, bounded regexes) and fail-open design.
+ * - Opt-in capture (src/trace-config.ts): the exact messages each LLM call sent and the model's answer
+ *   (OTEL_CAPTURE_LLM_MESSAGES), and chosen tools' outputs (OTEL_CAPTURE_TOOL_OUTPUT). Off, spans are 0.3.0's.
+ * - Two-tier secret redaction (exact match, then linear-time token patterns) before any cut, and fail-open design.
  * - Strict stdio hygiene: zero writes to stdout (all diagnostics redirected to stderr).
  */
 
-import { trace, context, SpanStatusCode, type Span } from '@opentelemetry/api';
-import { NodeTracerProvider, BatchSpanProcessor } from '@opentelemetry/sdk-trace-node';
+import { trace, context, SpanStatusCode, type Attributes, type Span } from '@opentelemetry/api';
+import { NodeTracerProvider, BatchSpanProcessor, type SpanProcessor } from '@opentelemetry/sdk-trace-node';
 import { resourceFromAttributes } from '@opentelemetry/resources';
 import { OTLPTraceExporter } from '@opentelemetry/exporter-trace-otlp-proto';
 import { ATTR_SERVICE_NAME } from '@opentelemetry/semantic-conventions';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import type { DeepSeekUsage } from './types.js';
+import {
+  PAYLOAD_MAX_CHARS,
+  PAYLOAD_TRUNCATION_MARKER,
+  resolveTraceSettings,
+  toolOutputMatcher,
+  type TraceSettings
+} from './trace-config.js';
+import type { ChatMessage, DeepSeekUsage } from './types.js';
 
 // ============================================================================
 // 1. SECRET HYGIENE & REDACTION
@@ -30,9 +39,16 @@ const PREFIXED_PATTERNS = [
   /\bgl(pat|rt|dt|ptt|cbt|oas)-[0-9a-zA-Z_-]+/g,
   /\bgh[pousr]_[0-9a-zA-Z]{36}\b/g,
   /ya29\.[0-9a-zA-Z_-]+/g,
-  /1\/\/[0-9a-zA-Z_-]+/g,
-  /\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+/g
+  /1\/\/[0-9a-zA-Z_-]+/g
 ];
+
+/**
+ * JWT, `\beyJ<10+ base64url>.eyJ<10+ base64url>.<1+ base64url>`, read in linear time. A token that starts inside a run of
+ * base64url characters must end that run with `.eyJ…`, so when the run's leftmost `eyJ` does not start a token, no later
+ * `eyJ` of the same run can: the second alternative then consumes the run. The single pattern this replaces re-scanned
+ * the run from every `eyJ` in it (0.2 s for 32 KB of `eyJ-eyJ-…`, 0.9 s for 64 KB) and redacts exactly the same tokens.
+ */
+const JWT_OR_RUN = /(\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+)|\beyJ[a-zA-Z0-9_-]*/g;
 
 const explicitSecrets = new Set<string>();
 let cachedProcessSecrets: string[] | null = null;
@@ -73,7 +89,10 @@ function getProcessSecrets(): string[] {
     'PHOENIX_API_KEY',
     'AGY_OAUTH_TOKEN_B64',
     'CLAUDE_CODE_OAUTH_TOKEN',
-    'ANTHROPIC_API_KEY'
+    'ANTHROPIC_API_KEY',
+    // A meeting or mail agent's own gate token: its tools' outputs and the messages sent to the model are traced.
+    'MEETING_GATE_TOKEN',
+    'MAIL_GATE_TOKEN'
   ];
 
   for (const key of sensitiveKeys) {
@@ -97,16 +116,16 @@ function getProcessSecrets(): string[] {
 }
 
 /**
- * Truncate a payload to maximum character length.
+ * Truncate a payload to maximum character length. trace-config.ts sizes the span value limit from this cut and marker.
  */
-export function truncatePayload(text: string, maxLen = 8192): string {
+export function truncatePayload(text: string, maxLen = PAYLOAD_MAX_CHARS): string {
   if (!text) {
     return '';
   }
   if (text.length <= maxLen) {
     return text;
   }
-  return `${text.slice(0, maxLen)}... [TRUNCATED]`;
+  return `${text.slice(0, maxLen)}${PAYLOAD_TRUNCATION_MARKER}`;
 }
 
 /**
@@ -124,6 +143,16 @@ export function redactSecrets(input: unknown): string {
     text = `${text.slice(0, 32768)}... [PRE_TRUNCATED]`;
   }
 
+  return redactText(text);
+}
+
+/**
+ * Redact a whole string, however long: every rule reads it in linear time. Message capture uses it directly, so a
+ * message is redacted in full before it is cut to its cap (a secret across the cut is never half kept).
+ */
+function redactText(input: string): string {
+  let text = input;
+
   // 1. Exact match against known process secrets
   const secrets = getProcessSecrets();
   for (const secret of secrets) {
@@ -132,12 +161,25 @@ export function redactSecrets(input: unknown): string {
     }
   }
 
-  // 2. Prefixed patterns (Nostr, DeepSeek, Anthropic, GitLab, GitHub, Google OAuth, JWT)
+  // 2. Prefixed patterns (Nostr, DeepSeek, Anthropic, GitLab, GitHub, Google OAuth), then JWT
   for (const pattern of PREFIXED_PATTERNS) {
     text = text.replace(pattern, '[REDACTED]');
   }
+  return text.replace(JWT_OR_RUN, (match: string, jwt: string | undefined) => (jwt === undefined ? match : '[REDACTED]'));
+}
 
-  return text;
+/** A JSON object or array (what a tool such as meeting_wait returns), as opposed to plain text. */
+function isJsonText(text: string): boolean {
+  const start = text.trimStart()[0];
+  if (start !== '{' && start !== '[') {
+    return false;
+  }
+  try {
+    JSON.parse(text);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -158,6 +200,233 @@ export function computeOutputBytes(output: unknown): number {
     return Buffer.byteLength(JSON.stringify(output), 'utf8');
   } catch {
     return 0;
+  }
+}
+
+// ============================================================================
+// 1b. MESSAGE CAPTURE (OTEL_CAPTURE_LLM_MESSAGES) — OpenInference llm.input_messages / llm.tools
+// ============================================================================
+
+/** What the adapter POSTs to /chat/completions: `messages`, `tools`, and the parameters (every other field). */
+export interface LlmRequestBody {
+  messages: readonly ChatMessage[];
+  tools?: readonly LlmToolDefinition[];
+  [parameter: string]: unknown;
+}
+
+/** An OpenAI function tool as sent in `tools`. */
+export interface LlmToolDefinition {
+  type?: string;
+  function?: { name?: string; description?: string; parameters?: unknown };
+}
+
+const OMITTED_FOR_SIZE = '…[omitted for size]';
+/** Attributes left free on an LLM span for what it records besides its messages and tool names: the span's own,
+ *  invocation parameters, counts, token usage, output value and the answer's tool calls. */
+const RESERVED_LLM_ATTRIBUTES = 64;
+/** llm.invocation_parameters, llm.input_messages_total, _omitted, _trimmed. */
+const REQUEST_SUMMARY_ATTRIBUTES = 4;
+
+function truncationMarker(removed: number): string {
+  return `…[truncated ${removed.toString()} chars]`;
+}
+
+/** At most `maxChars` characters, marker included; the cut never splits a surrogate pair. */
+function capText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) {
+    return text;
+  }
+  let keep = Math.max(0, maxChars - truncationMarker(text.length).length);
+  const last = text.charCodeAt(keep - 1);
+  if (keep > 0 && last >= 0xd800 && last <= 0xdbff) {
+    keep -= 1;
+  }
+  return `${text.slice(0, keep)}${truncationMarker(text.length - keep)}`;
+}
+
+/** A message field as text: strings as they are, other values as JSON, nothing for null/undefined. */
+function textOf(value: unknown): string | undefined {
+  if (value === null || value === undefined) {
+    return undefined;
+  }
+  return typeof value === 'string' ? value : JSON.stringify(value);
+}
+
+interface CapturedToolCall {
+  id?: string;
+  name?: string;
+  args?: string;
+}
+
+interface CapturedMessage {
+  role: string;
+  content?: string;
+  toolCallId?: string;
+  toolCalls: CapturedToolCall[];
+}
+
+function toolCallsOf(message: unknown): Array<Record<string, unknown>> {
+  const calls = (message as { tool_calls?: unknown }).tool_calls;
+  return Array.isArray(calls)
+    ? calls.filter((call): call is Record<string, unknown> => Boolean(call) && typeof call === 'object')
+    : [];
+}
+
+function functionOf(call: Record<string, unknown>): Record<string, unknown> {
+  const fn = call.function;
+  return fn && typeof fn === 'object' ? (fn as Record<string, unknown>) : {};
+}
+
+/** How many attributes a message becomes, from its shape alone (nothing is redacted to count). */
+function attributeCountOf(message: ChatMessage): number {
+  let count = 1 + (message.content === null || message.content === undefined ? 0 : 1);
+  count += message.tool_call_id === null || message.tool_call_id === undefined ? 0 : 1;
+  for (const call of toolCallsOf(message)) {
+    const fn = functionOf(call);
+    count += (call.id === undefined ? 0 : 1) + (fn.name === undefined ? 0 : 1) + (fn.arguments === undefined ? 0 : 1);
+  }
+  return count;
+}
+
+function capturedMessage(message: ChatMessage, record: (raw: string) => string): CapturedMessage {
+  const content = textOf(message.content);
+  const toolCallId = textOf(message.tool_call_id);
+  return {
+    role: textOf(message.role) ?? 'unknown',
+    ...(content === undefined ? {} : { content: record(content) }),
+    ...(toolCallId === undefined ? {} : { toolCallId: record(toolCallId) }),
+    toolCalls: toolCallsOf(message).map((call) => {
+      const fn = functionOf(call);
+      const [id, name, args] = [textOf(call.id), textOf(fn.name), textOf(fn.arguments)];
+      return {
+        ...(id === undefined ? {} : { id: record(id) }),
+        ...(name === undefined ? {} : { name: record(name) }),
+        ...(args === undefined ? {} : { args: record(args) })
+      };
+    })
+  };
+}
+
+function capturedSize(message: CapturedMessage): number {
+  return message.toolCalls.reduce((size, call) => size + (call.args?.length ?? 0), message.content?.length ?? 0);
+}
+
+/** Replace a message's content and arguments by OMITTED_FOR_SIZE; false when there was nothing longer to cut. */
+function omitForSize(message: CapturedMessage): boolean {
+  let cut = false;
+  if (message.content !== undefined && message.content.length > OMITTED_FOR_SIZE.length) {
+    message.content = OMITTED_FOR_SIZE;
+    cut = true;
+  }
+  for (const call of message.toolCalls) {
+    if (call.args !== undefined && call.args.length > OMITTED_FOR_SIZE.length) {
+      call.args = OMITTED_FOR_SIZE;
+      cut = true;
+    }
+  }
+  return cut;
+}
+
+function setMessageAttributes(attributes: Attributes, prefix: string, message: CapturedMessage): void {
+  attributes[`${prefix}.message.role`] = message.role;
+  if (message.content !== undefined) {
+    attributes[`${prefix}.message.content`] = message.content;
+  }
+  if (message.toolCallId !== undefined) {
+    attributes[`${prefix}.message.tool_call_id`] = message.toolCallId;
+  }
+  message.toolCalls.forEach((call, j) => {
+    const at = `${prefix}.message.tool_calls.${j.toString()}.tool_call`;
+    if (call.id !== undefined) {
+      attributes[`${at}.id`] = call.id;
+    }
+    if (call.name !== undefined) {
+      attributes[`${at}.function.name`] = call.name;
+    }
+    if (call.args !== undefined) {
+      attributes[`${at}.function.arguments`] = call.args;
+    }
+  });
+}
+
+/**
+ * The attributes of an LLM span that say exactly what was sent: OpenInference llm.input_messages.<i>.message.*,
+ * llm.invocation_parameters (the body without messages and tools), llm.tools.<k>.tool.*, and how many messages were
+ * sent, left out (over OTEL_LLM_MESSAGES_MAX or the span's attribute count) or cut (over the total budget).
+ */
+function llmRequestAttributes(body: LlmRequestBody, settings: TraceSettings, record: (raw: string) => string): Attributes {
+  const { messages, tools, ...parameters } = body;
+  const sent: readonly ChatMessage[] = Array.isArray(messages) ? (messages as readonly ChatMessage[]) : [];
+  const toolList: readonly LlmToolDefinition[] = Array.isArray(tools) ? (tools as readonly LlmToolDefinition[]) : [];
+  const attributes: Attributes = {
+    'llm.invocation_parameters': record(JSON.stringify(parameters)),
+    'llm.input_messages_total': sent.length
+  };
+
+  // Attribute budget: what the span may hold minus what it records besides the messages.
+  let free = Math.max(
+    0,
+    (settings.spanLimits.attributeCountLimit ?? 128) - RESERVED_LLM_ATTRIBUTES - REQUEST_SUMMARY_ATTRIBUTES
+  );
+  const perTool = settings.captureLlmToolSchemas ? 3 : 1;
+  const toolCount = Math.min(toolList.length, Math.floor(free / perTool));
+  free -= toolCount * perTool;
+
+  // Which messages: the first 2 and the newest MAX-2; then, while over the attribute budget, the oldest of the middle.
+  const max = settings.llmMessagesMax;
+  let kept = sent.map((_, i) => i);
+  if (sent.length > max) {
+    kept = [0, 1, ...kept.slice(sent.length - (max - 2))];
+  }
+  let attributeCount = kept.reduce((n, i) => n + attributeCountOf(sent[i] as ChatMessage), 0);
+  while (attributeCount > free && kept.length > 0) {
+    const at = kept.length > 3 ? 2 : kept.length === 3 ? 1 : 0;
+    attributeCount -= attributeCountOf(sent[kept[at] as number] as ChatMessage);
+    kept.splice(at, 1);
+  }
+
+  // Total budget: cut the oldest middle messages (never the first 2 or the last 4) until the contents fit.
+  const captured = kept.map((i) => capturedMessage(sent[i] as ChatMessage, record));
+  let size = captured.reduce((n, message) => n + capturedSize(message), 0);
+  let trimmed = 0;
+  for (let i = 2; i < captured.length - 4 && size > settings.llmMessagesMaxTotalChars; i++) {
+    const message = captured[i] as CapturedMessage;
+    const before = capturedSize(message);
+    if (omitForSize(message)) {
+      size -= before - capturedSize(message);
+      trimmed++;
+    }
+  }
+
+  if (sent.length > kept.length) {
+    attributes['llm.input_messages_omitted'] = sent.length - kept.length;
+  }
+  if (trimmed > 0) {
+    attributes['llm.input_messages_trimmed'] = trimmed;
+  }
+  captured.forEach((message, i) => {
+    setMessageAttributes(attributes, `llm.input_messages.${i.toString()}`, message);
+  });
+  toolList.slice(0, toolCount).forEach((tool, k) => {
+    const fn: NonNullable<LlmToolDefinition['function']> = (tool && typeof tool === 'object' ? tool.function : undefined) ?? {};
+    const at = `llm.tools.${k.toString()}.tool`;
+    attributes[`${at}.name`] = record(textOf(fn.name) ?? '');
+    if (settings.captureLlmToolSchemas) {
+      attributes[`${at}.description`] = record(textOf(fn.description) ?? '');
+      attributes[`${at}.json_schema`] = record(JSON.stringify(tool));
+    }
+  });
+  return attributes;
+}
+
+let captureErrorCount = 0;
+
+/** Capture must never break or stop a turn: a failure is logged (the first, then every 100th) and the span goes on. */
+function logCaptureError(err: unknown): void {
+  captureErrorCount++;
+  if (captureErrorCount === 1 || captureErrorCount % 100 === 0) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.error(`[deepseek-acp:TELEMETRY] Message capture failed (#${captureErrorCount.toString()}): ${msg}`);
   }
 }
 
@@ -277,7 +546,24 @@ export function extractPostedEventId(output: unknown): string | undefined {
 
 export interface LlmSpanHandle {
   recordUsage(usage: DeepSeekUsage): void;
+  /**
+   * With OTEL_CAPTURE_LLM_MESSAGES=true, record exactly what is about to be sent (call it right before the request, so a
+   * failed request still shows it). Otherwise nothing. Never throws.
+   */
+  recordRequest(body: LlmRequestBody): void;
+  /**
+   * With OTEL_CAPTURE_LLM_MESSAGES=true, record the model's answer as llm.output_messages.0 — on every path that ends
+   * the span, including a stream that broke half-way (what had arrived). The first call wins; nothing after the span
+   * ended. Never throws.
+   */
+  recordOutput(message: LlmOutputMessage): void;
   end(outputValue?: string, errorMessage?: string): void;
+}
+
+/** The assistant message the model returned (or had returned when the stream stopped). */
+export interface LlmOutputMessage {
+  content: string | null;
+  tool_calls?: readonly unknown[];
 }
 
 export interface SteerSpanParams {
@@ -372,7 +658,19 @@ export function getPackageVersion(): string {
 // 5. INITIALIZATION & ENGINE IMPLEMENTATION
 // ============================================================================
 
-export function initTelemetry(options?: { secrets?: string[] }): TelemetryService | null {
+export interface TelemetryOptions {
+  /** Redacted by exact match (and as base64) wherever they appear, e.g. DEEPSEEK_API_KEY read before the env purge. */
+  secrets?: string[];
+  /** What to record and how to size the provider and exporter; resolveTraceSettings(process.env) when omitted. */
+  trace?: TraceSettings;
+  /**
+   * Test seam: a span processor that replaces the OTLP export (tests pass a SimpleSpanProcessor over an
+   * InMemorySpanExporter). With it no endpoint is needed and nothing is registered globally.
+   */
+  spanProcessor?: SpanProcessor;
+}
+
+export function initTelemetry(options?: TelemetryOptions): TelemetryService | null {
   if (options?.secrets) {
     for (const s of options.secrets) {
       registerSecret(s);
@@ -381,11 +679,13 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
 
   const tracesEndpoint =
     process.env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT ?? process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
-  if (!tracesEndpoint) {
+  const injectedProcessor = options?.spanProcessor;
+  if (!tracesEndpoint && !injectedProcessor) {
     return null;
   }
 
   try {
+    const settings = options?.trace ?? resolveTraceSettings(process.env).settings;
     const serviceName = process.env.OTEL_SERVICE_NAME ?? 'deepseek-agent';
     const projectName = process.env.PHOENIX_PROJECT_NAME ?? 'default';
     const apiKey = process.env.PHOENIX_API_KEY;
@@ -397,18 +697,17 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
       headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
-    const exporter = new OTLPTraceExporter({
-      url: tracesEndpoint,
-      headers,
-      timeoutMillis: 1500
-    });
-
-    const batchProcessor = new BatchSpanProcessor(exporter, {
-      maxQueueSize: 2048,
-      maxExportBatchSize: 128,
-      scheduledDelayMillis: 5000,
-      exportTimeoutMillis: 1500
-    });
+    // Without capture these are 0.3.0's settings (trace-config.ts); capture raises the limits and the export timeout.
+    const spanProcessor =
+      injectedProcessor ??
+      new BatchSpanProcessor(
+        new OTLPTraceExporter({
+          url: tracesEndpoint,
+          headers,
+          timeoutMillis: settings.exporter.timeoutMillis
+        }),
+        { ...settings.batch }
+      );
 
     const resource = resourceFromAttributes({
       [ATTR_SERVICE_NAME]: serviceName,
@@ -417,14 +716,15 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
 
     const provider = new NodeTracerProvider({
       resource,
-      spanProcessors: [batchProcessor],
-      spanLimits: {
-        attributeValueLengthLimit: 8192
-      }
+      spanProcessors: [spanProcessor],
+      spanLimits: { ...settings.spanLimits }
     });
 
-    provider.register();
-    const tracer = trace.getTracer('deepseek-agent-acp', getPackageVersion());
+    if (!injectedProcessor) {
+      provider.register();
+    }
+    const tracer = provider.getTracer('deepseek-agent-acp', getPackageVersion());
+    const capturesToolOutput = toolOutputMatcher(settings.toolOutput);
 
     return {
       startTurnSpan(
@@ -476,6 +776,10 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
         let totalReasoningTokens = 0;
         let totalCacheHitTokens = 0;
 
+        // Message capture: every model call of a turn re-sends the whole history (a call is one turn of up to an
+        // hour), so each distinct string is redacted and capped once per turn. Holds only the latest request's strings.
+        let capturedStrings = new Map<string, string>();
+
         return {
           startLlmSpan(llmModel: string, iteration = 1): LlmSpanHandle {
             const effectiveModel = llmModel || modelName || process.env.DEEPSEEK_MODEL || 'deepseek-chat';
@@ -492,8 +796,51 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
             }, rootContext);
 
             activeLlmSpans.add(llmSpan);
+            let requestRecorded = false;
+            let outputRecorded = false;
 
             return {
+              recordRequest(body: LlmRequestBody): void {
+                if (!settings.captureLlmMessages || requestRecorded || !llmSpan.isRecording()) {
+                  return;
+                }
+                requestRecorded = true;
+                try {
+                  const previous = capturedStrings;
+                  const current = new Map<string, string>();
+                  const record = (raw: string): string => {
+                    let value = current.get(raw) ?? previous.get(raw);
+                    if (value === undefined) {
+                      value = capText(redactText(raw), settings.llmMessageMaxChars);
+                    }
+                    current.set(raw, value);
+                    return value;
+                  };
+                  llmSpan.setAttributes(llmRequestAttributes(body, settings, record));
+                  capturedStrings = current;
+                } catch (err: unknown) {
+                  logCaptureError(err);
+                }
+              },
+
+              recordOutput(message: LlmOutputMessage): void {
+                if (!settings.captureLlmMessages || outputRecorded || !llmSpan.isRecording()) {
+                  return;
+                }
+                outputRecorded = true;
+                try {
+                  const answer = { role: 'assistant', content: message.content, tool_calls: message.tool_calls };
+                  const captured = capturedMessage(answer as ChatMessage, (raw) =>
+                    capText(redactText(raw), settings.llmMessageMaxChars)
+                  );
+                  const attributes: Attributes = {};
+                  setMessageAttributes(attributes, 'llm.output_messages.0', captured);
+                  llmSpan.setAttributes(attributes);
+                } catch (err: unknown) {
+                  logCaptureError(err);
+                }
+              },
+
               recordUsage(usage: DeepSeekUsage): void {
                 const promptTokens = usage.prompt_tokens || 0;
                 // In DeepSeek-R1, completion_tokens already includes reasoning_tokens
@@ -595,10 +942,12 @@ export function initTelemetry(options?: { secrets?: string[] }): TelemetryServic
               }
             }
 
-            if (process.env.OTEL_CAPTURE_TOOL_OUTPUT === 'true' && output !== undefined && !hasPostedId) {
+            // OTEL_CAPTURE_TOOL_OUTPUT (true, or names/globs such as meeting_*). The MIME type describes the recorded
+            // value: JSON cut at 8 KB is no longer JSON. buzz-trace reads posted ids only from posting tools' outputs.
+            if (capturesToolOutput(entry.toolName) && output !== undefined && !hasPostedId) {
               const sanitizedOut = truncatePayload(redactSecrets(output), 8192);
               toolSpan.setAttribute('output.value', sanitizedOut);
-              toolSpan.setAttribute('output.mime_type', 'text/plain');
+              toolSpan.setAttribute('output.mime_type', isJsonText(sanitizedOut) ? 'application/json' : 'text/plain');
             }
 
             toolSpan.setAttribute('tool.is_error', Boolean(isError));

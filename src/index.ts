@@ -27,9 +27,11 @@ import {
   initTelemetry,
   registerSecret,
   parseNostrContext,
+  type LlmSpanHandle,
   type TelemetryService,
   type TurnSpanHandle
 } from './telemetry.js';
+import { describeTraceSettings, resolveTraceSettings } from './trace-config.js';
 import type {
   ChatMessage,
   JSONRPCRequest,
@@ -109,9 +111,11 @@ if (!DEEPSEEK_API_KEY) {
 }
 registerSecret(DEEPSEEK_API_KEY);
 
-// OpenTelemetry & Arize Phoenix Telemetry Service
+// OpenTelemetry & Arize Phoenix Telemetry Service. What it records beyond 0.3.0 is opt-in (src/trace-config.ts).
+const TRACE = resolveTraceSettings(process.env);
 const telemetryService: TelemetryService | null = initTelemetry({
-  secrets: DEEPSEEK_API_KEY ? [DEEPSEEK_API_KEY] : []
+  secrets: DEEPSEEK_API_KEY ? [DEEPSEEK_API_KEY] : [],
+  trace: TRACE.settings
 });
 
 // Configuration
@@ -132,6 +136,20 @@ console.info(
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
     `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()}`
 );
+// The trace settings matter only when spans are exported (an OTLP endpoint is set).
+if (telemetryService) {
+  for (const warning of TRACE.warnings) {
+    console.warn(warning);
+  }
+  console.info(`[config] tracing ${describeTraceSettings(TRACE.settings)}`);
+}
+
+/** What the model had answered when its stream stopped half-way; nothing when nothing had arrived. */
+function recordPartialAnswer(llmSpan: LlmSpanHandle | undefined, partial: StreamAccumulator | null): void {
+  if (partial && (partial.content || partial.toolCalls.length > 0)) {
+    llmSpan?.recordOutput({ content: partial.content || null, tool_calls: partial.toolCalls });
+  }
+}
 
 // ============================================================================
 // 3. PROMPT ADAPTATION LAYER
@@ -452,22 +470,26 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         ? AbortSignal.any([session.abortController.signal, timeoutSignal])
         : timeoutSignal;
 
+      const requestBody = {
+        model: MODEL,
+        messages: messagesPayload,
+        tools: tools && tools.length > 0 ? tools : undefined,
+        temperature: TEMPERATURE,
+        // thinking / reasoning_effort: only present when DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT are set.
+        ...REASONING.params,
+        stream: true,
+        stream_options: { include_usage: true }
+      };
+      // OTEL_CAPTURE_LLM_MESSAGES: recorded before the request, so a failed request still shows what was sent.
+      llmSpan?.recordRequest(requestBody);
+
       const response = await fetch(`${BASE_URL}/chat/completions`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
           Authorization: `Bearer ${DEEPSEEK_API_KEY}`
         },
-        body: JSON.stringify({
-          model: MODEL,
-          messages: messagesPayload,
-          tools: tools && tools.length > 0 ? tools : undefined,
-          temperature: TEMPERATURE,
-          // thinking / reasoning_effort: only present when DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT are set.
-          ...REASONING.params,
-          stream: true,
-          stream_options: { include_usage: true }
-        }),
+        body: JSON.stringify(requestBody),
         signal: combinedSignal
       });
 
@@ -480,35 +502,42 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       // Stream accumulator for 3-phase events
       let accumulator: StreamAccumulator | null = null;
 
-      for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
-        if (session.abortController?.signal?.aborted || !session.abortController) {
-          llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
-          throw new Error('Stream aborted by client cancellation.');
-        }
+      try {
+        for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+          if (session.abortController?.signal?.aborted || !session.abortController) {
+            recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
+            llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
+            throw new Error('Stream aborted by client cancellation.');
+          }
 
-        if (event.type === 'delta') {
-          if (event.reasoningDelta) {
-            sendNotification('session/update', {
-              sessionId,
-              delta: {
-                type: 'thought',
-                text: event.reasoningDelta
-              }
-            });
+          if (event.type === 'delta') {
+            if (event.reasoningDelta) {
+              sendNotification('session/update', {
+                sessionId,
+                delta: {
+                  type: 'thought',
+                  text: event.reasoningDelta
+                }
+              });
+            }
+            if (event.contentDelta) {
+              sendNotification('session/update', {
+                sessionId,
+                delta: {
+                  type: 'text',
+                  text: event.contentDelta
+                }
+              });
+            }
           }
-          if (event.contentDelta) {
-            sendNotification('session/update', {
-              sessionId,
-              delta: {
-                type: 'text',
-                text: event.contentDelta
-              }
-            });
+          if (event.accumulator) {
+            accumulator = event.accumulator as StreamAccumulator;
           }
         }
-        if (event.accumulator) {
-          accumulator = event.accumulator as StreamAccumulator;
-        }
+      } catch (streamErr: unknown) {
+        // The stream broke half-way (read timeout, reset): the turn's end closes this span; keep what had arrived.
+        recordPartialAnswer(llmSpan, accumulator);
+        throw streamErr;
       }
 
       if (!accumulator) {
@@ -533,6 +562,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       // Truncated Stream / Synthetic Tool Error
       if (accumulator.isTruncated() && accumulator.toolCalls.length > 0) {
         console.warn(`[SAFE STREAM] finish_reason === 'length' on tool call. Injecting synthetic tool error.`);
+        llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: accumulator.toolCalls });
         llmSpan?.end(undefined, 'Tool execution truncated due to token limits.');
         assistantMsg.tool_calls = accumulator.toolCalls.map((tc) => ({
           id: tc.id,
@@ -570,6 +600,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
       // No tool calls means the model produced its final response text
       if (validToolCalls.length === 0) {
+        llmSpan?.recordOutput({ content: accumulator.content || null });
         llmSpan?.end(accumulator.content || undefined);
         session.messages.push(assistantMsg);
         session.commit();
@@ -591,6 +622,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       }
 
       // Tool calls were produced: close current iteration's LLM span before executing tools
+      llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: validToolCalls });
       llmSpan?.end(accumulator.content || undefined);
       assistantMsg.tool_calls = validToolCalls;
       session.messages.push(assistantMsg);

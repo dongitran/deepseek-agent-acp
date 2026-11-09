@@ -49,6 +49,84 @@ test('Secret Redaction: Base64 secret variant is also redacted', () => {
   assert.ok(redacted.includes('[REDACTED]'));
 });
 
+// The 0.3.0 patterns, copied verbatim: redactSecrets must keep giving exactly their result.
+const PATTERNS_0_3_0 = [
+  /nsec1[0-9a-z]{58}/gi,
+  /sk-[a-zA-Z0-9_\-.]{20,64}/g,
+  /sk-ant-[a-zA-Z0-9_.-]+/g,
+  /\bgl(pat|rt|dt|ptt|cbt|oas)-[0-9a-zA-Z_-]+/g,
+  /\bgh[pousr]_[0-9a-zA-Z]{36}\b/g,
+  /ya29\.[0-9a-zA-Z_-]+/g,
+  /1\/\/[0-9a-zA-Z_-]+/g,
+  /\beyJ[a-zA-Z0-9_-]{10,}\.eyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]+/g
+];
+
+function mulberry32(seed) {
+  let a = seed;
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test('Secret Redaction: redactSecrets redacts exactly what the 0.3.0 patterns redacted (JWT-like text, 20,000 cases)', () => {
+  _resetProcessSecretsCache();
+  const pieces = [
+    'eyJ', 'eyJabcdefghij', 'eyJ0123456789_-', 'abcdefghijk', '-', '_', '.', 'x', ' ', '"', '=', 'é',
+    'eyJhbGciOiJIUzI1NiJ9', '.eyJzdWIiOiIxMjM0NTY3ODkwIn0', '.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c',
+    'eyJ-', '.eyJ', 'sk-', 'sk-ant-', 'Bearer ', 'glpat-', 'ya29.'
+  ];
+  const random = mulberry32(64);
+  let redactedCases = 0;
+  for (let n = 0; n < 20000; n++) {
+    let text = '';
+    const count = 1 + Math.floor(random() * 14);
+    for (let i = 0; i < count; i++) {
+      text += pieces[Math.floor(random() * pieces.length)];
+    }
+    const expected = PATTERNS_0_3_0.reduce((acc, pattern) => acc.replace(pattern, '[REDACTED]'), text);
+    if (expected !== text) {
+      redactedCases++;
+    }
+    assert.equal(redactSecrets(text), expected, JSON.stringify(text));
+  }
+  assert.ok(redactedCases > 1000, `the cases must exercise the patterns (only ${redactedCases} redacted)`);
+});
+
+test('Secret Redaction: a long run of eyJ-eyJ-… is redacted in linear time (0.3.0 took ~0.2 s for 32 KB)', () => {
+  _resetProcessSecretsCache();
+  const run = 'eyJ-'.repeat(8192);
+  const jwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c';
+  const started = process.hrtime.bigint();
+  const redacted = redactSecrets(`${run.slice(0, 32000)} ${jwt}`);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(elapsedMs < 100, `redacting 32 KB took ${elapsedMs.toFixed(1)} ms`);
+  assert.ok(redacted.endsWith(' [REDACTED]'), 'the token after the run is still redacted');
+});
+
+test('Secret Redaction: the meeting and mail gate tokens in the environment are redacted', () => {
+  const saved = { meeting: process.env.MEETING_GATE_TOKEN, mail: process.env.MAIL_GATE_TOKEN };
+  process.env.MEETING_GATE_TOKEN = 'mgt-0f3c9a7e5d2b4c6a8e1f';
+  process.env.MAIL_GATE_TOKEN = 'mlt-7d1e3b5a9c2f4e6d8a0b';
+  try {
+    _resetProcessSecretsCache();
+    const redacted = redactSecrets('gate said: Bearer mgt-0f3c9a7e5d2b4c6a8e1f and mail mlt-7d1e3b5a9c2f4e6d8a0b');
+    assert.ok(!redacted.includes('mgt-0f3c9a7e5d2b4c6a8e1f'), redacted);
+    assert.ok(!redacted.includes('mlt-7d1e3b5a9c2f4e6d8a0b'), redacted);
+  } finally {
+    for (const [name, value] of [['MEETING_GATE_TOKEN', saved.meeting], ['MAIL_GATE_TOKEN', saved.mail]]) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    _resetProcessSecretsCache();
+  }
+});
+
 test('truncatePayload: truncates long text cleanly', () => {
   const shortText = 'Hello World';
   assert.equal(truncatePayload(shortText, 50), 'Hello World');
