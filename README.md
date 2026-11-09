@@ -172,8 +172,8 @@ Everything beyond that is opt-in. With none of these variables set, every span i
 | :--- | :--- | :--- |
 | `OTEL_CAPTURE_LLM_MESSAGES` | off | `true`: each LLM span records the exact request sent to DeepSeek and the model's answer. |
 | `OTEL_CAPTURE_LLM_TOOL_SCHEMAS` | off | `true` (with the above): also each tool's description and JSON schema. Large. |
-| `OTEL_CAPTURE_TOOL_OUTPUT` | off | `true`: every tool's output; or a comma-separated list of tool names with `*` wildcards, case-insensitive (`meeting_*,thread_read`). `false`/empty: none. |
-| `OTEL_LLM_MESSAGE_MAX_CHARS` | `65536` | The longest recorded content or arguments string; a longer one ends with `…[truncated N chars]`. |
+| `OTEL_CAPTURE_TOOL_OUTPUT` | off | `true`: every tool's output; or a comma-separated list of tool names with `*` wildcards, case-insensitive (`meeting_*,thread_read`). Empty, `false`, `0`, `no`, `off` or `none`: none. |
+| `OTEL_LLM_MESSAGE_MAX_CHARS` | `65536` | The longest recorded content or arguments string (64 or more); a longer one ends with `…[truncated N chars]`. |
 | `OTEL_LLM_MESSAGES_MAX` | `400` | The most messages per span: the first 2 and the newest `MAX-2` (3 or more); `llm.input_messages_omitted` says how many were left out. |
 | `OTEL_LLM_MESSAGES_MAX_TOTAL_CHARS` | `524288` | Budget for all recorded contents of one span: over it, the oldest middle contents (never the first 2 or the last 4) become `…[omitted for size]`; `llm.input_messages_trimmed` counts them. |
 
@@ -209,9 +209,9 @@ span holds the system prompt plus the conversation so far: with a 12 KB system p
 
 **Privacy.** Message capture stores everything the model reads in Phoenix: the system prompt, people's words (a call's
 transcript), and every tool result. Known secrets are redacted before anything is cut — the API key and the tokens in
-the adapter's environment (exact match, also base64) and token formats such as `sk-…`, `glpat-…`, `ghp_…`, `nsec1…` and
-JWTs. Anything else is stored as it is. Turn capture on only where everyone who can open the Phoenix project may read
-those conversations.
+the adapter's environment (exact match, also base64, and their beginning when a string stops part-way through one) and
+token formats such as `sk-…`, `glpat-…`, `ghp_…`, `nsec1…` and JWTs. Anything else is stored as it is. Turn capture on
+only where everyone who can open the Phoenix project may read those conversations.
 
 ---
 

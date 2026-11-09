@@ -136,6 +136,28 @@ test('OTEL_CAPTURE_TOOL_OUTPUT: only * is a wildcard; a dot is a dot', () => {
   assert.equal(all('anything_at_all'), true);
 });
 
+test('OTEL_CAPTURE_TOOL_OUTPUT: words that mean off (0, no, off, none, disabled) capture nothing, keep 0.3.0 settings', () => {
+  // 0.3.0 captured only on "true": these must not become tool names that raise the limits.
+  for (const raw of ['0', 'no', 'off', 'none', 'disabled', 'OFF']) {
+    const { settings, warnings } = resolveTraceSettings({ OTEL_CAPTURE_TOOL_OUTPUT: raw });
+    assert.deepEqual(settings.toolOutput, { mode: 'none' }, raw);
+    assert.deepEqual(warnings, [], raw);
+    assert.deepEqual(settings.spanLimits, LEGACY_SPAN_LIMITS, raw);
+    assert.match(describeTraceSettings(settings), /tool_output=off/, raw);
+  }
+});
+
+test('OTEL_CAPTURE_TOOL_OUTPUT: 1, yes, on, enabled or all are not tool names: nothing is captured, the warning says true', () => {
+  for (const raw of ['1', 'yes', 'on', 'enabled', 'all', 'YES']) {
+    const { settings, warnings } = resolveTraceSettings({ OTEL_CAPTURE_TOOL_OUTPUT: raw });
+    assert.deepEqual(settings.toolOutput, { mode: 'none' }, raw);
+    assert.deepEqual(settings.spanLimits, LEGACY_SPAN_LIMITS, raw);
+    assert.equal(warnings.length, 1, raw);
+    assert.match(warnings[0], /OTEL_CAPTURE_TOOL_OUTPUT/);
+    assert.match(warnings[0], /"true"/);
+  }
+});
+
 test('OTEL_CAPTURE_TOOL_OUTPUT: a malformed list captures nothing and warns once, naming the variable', () => {
   for (const raw of ['meeting wait', 'a,,b', ',meeting_*', 'meeting_*,', 'meeting_*;thread_read', 'tool?']) {
     const { settings, warnings } = resolveTraceSettings({ OTEL_CAPTURE_TOOL_OUTPUT: raw });
@@ -176,6 +198,14 @@ test('an invalid message cap falls back to its default with a warning that names
       assert.match(warnings[0], new RegExp(name));
     }
   }
+});
+
+test('OTEL_LLM_MESSAGE_MAX_CHARS leaves room for its own …[truncated N chars] marker: 64 or more', () => {
+  const small = resolveTraceSettings({ ...ON, OTEL_LLM_MESSAGE_MAX_CHARS: '22' });
+  assert.equal(small.settings.llmMessageMaxChars, 65536);
+  assert.equal(small.warnings.length, 1);
+  assert.match(small.warnings[0], /OTEL_LLM_MESSAGE_MAX_CHARS/);
+  assert.equal(resolveTraceSettings({ ...ON, OTEL_LLM_MESSAGE_MAX_CHARS: '64' }).settings.llmMessageMaxChars, 64);
 });
 
 test('OTEL_LLM_MESSAGES_MAX keeps the first two messages and at least the last one, so it is 3 or more', () => {

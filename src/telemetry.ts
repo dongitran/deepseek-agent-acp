@@ -168,6 +168,33 @@ function redactText(input: string): string {
   return text.replace(JWT_OR_RUN, (match: string, jwt: string | undefined) => (jwt === undefined ? match : '[REDACTED]'));
 }
 
+/** The shortest beginning of a known secret that redactCutSecret removes from the end of a string. */
+const MIN_SECRET_PREFIX = 8;
+
+/**
+ * A string that stops part-way through a known secret — an answer cut by the stream or the token limit, a tool output
+ * its tool cut — loses that beginning: exact-match redaction cannot see a secret that is only half there.
+ */
+function redactCutSecret(text: string): string {
+  if (text.length < MIN_SECRET_PREFIX) {
+    return text;
+  }
+  const last = text.charCodeAt(text.length - 1);
+  for (const secret of getProcessSecrets()) {
+    for (let k = Math.min(secret.length - 1, text.length); k >= MIN_SECRET_PREFIX; k--) {
+      if (secret.charCodeAt(k - 1) === last && text.endsWith(secret.slice(0, k))) {
+        return `${text.slice(0, text.length - k)}[REDACTED]`;
+      }
+    }
+  }
+  return text;
+}
+
+/** What message capture records for one string: redacted whole, then a cut secret at its end, then capped. */
+function captureText(raw: string, maxChars: number): string {
+  return capText(redactCutSecret(redactText(raw)), maxChars);
+}
+
 /** A JSON object or array (what a tool such as meeting_wait returns), as opposed to plain text. */
 function isJsonText(text: string): boolean {
   const start = text.trimStart()[0];
@@ -811,7 +838,7 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                   const record = (raw: string): string => {
                     let value = current.get(raw) ?? previous.get(raw);
                     if (value === undefined) {
-                      value = capText(redactText(raw), settings.llmMessageMaxChars);
+                      value = captureText(raw, settings.llmMessageMaxChars);
                     }
                     current.set(raw, value);
                     return value;
@@ -831,7 +858,7 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                 try {
                   const answer = { role: 'assistant', content: message.content, tool_calls: message.tool_calls };
                   const captured = capturedMessage(answer as ChatMessage, (raw) =>
-                    capText(redactText(raw), settings.llmMessageMaxChars)
+                    captureText(raw, settings.llmMessageMaxChars)
                   );
                   const attributes: Attributes = {};
                   setMessageAttributes(attributes, 'llm.output_messages.0', captured);

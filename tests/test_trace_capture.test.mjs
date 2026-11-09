@@ -383,6 +383,33 @@ test('the answer is redacted and capped like the request', () => {
   );
 });
 
+test('redaction: a string cut in the middle of a known secret keeps none of that secret', () => {
+  const key = 'dskeyfeedbeef0123456789abcdef';
+  // An answer cut by the stream or the token limit, half-way through a secret the model was repeating.
+  const span = callEndingWith(
+    (llm, turn) => {
+      llm.recordOutput({
+        content: `the token is ${key.slice(0, 14)}`,
+        tool_calls: [{ id: 'c1', type: 'function', function: { name: 'reply', arguments: `{"text":"${key.slice(0, 20)}` } }]
+      });
+      llm.end(undefined, 'Tool execution truncated due to token limits.');
+      turn.end('OK', 'x');
+    },
+    ON,
+    [key]
+  );
+  assert.equal(span.attributes['llm.output_messages.0.message.content'], 'the token is [REDACTED]');
+  assert.equal(
+    span.attributes['llm.output_messages.0.message.tool_calls.0.tool_call.function.arguments'],
+    '{"text":"[REDACTED]'
+  );
+  // A tool output that a tool itself cut half-way through the secret.
+  const messages = chat(2);
+  messages.push({ role: 'tool', tool_call_id: 'c2', content: `log tail ${key.slice(0, 9)}` });
+  const a = oneCall(ON, requestBody(messages), { secrets: [key] }).span.attributes;
+  assert.equal(a['llm.input_messages.2.message.content'], 'log tail [REDACTED]');
+});
+
 test('capture never throws into the turn: malformed input is skipped and the span still ends normally', () => {
   const circular = {};
   circular.self = circular;

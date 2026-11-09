@@ -16,6 +16,8 @@ export const DEFAULT_LLM_MESSAGES_MAX = 400;
 export const DEFAULT_LLM_MESSAGES_MAX_TOTAL_CHARS = 524_288;
 /** The fewest messages a span may keep: the first two (system prompt, first prompt) and the newest one. */
 export const MIN_LLM_MESSAGES_MAX = 3;
+/** The smallest per-string cap that still holds its own marker (`…[truncated 1000000000 chars]` is 30 characters). */
+export const MIN_LLM_MESSAGE_MAX_CHARS = 64;
 
 /** truncatePayload's cut for tool outputs and previews, and the marker it appends. */
 export const PAYLOAD_MAX_CHARS = 8192;
@@ -97,16 +99,24 @@ function resolveFlag(env: Env, name: string, warnings: string[]): boolean {
 
 /** A tool name or a pattern with `*` wildcards; lower-cased before the check. */
 const TOOL_NAME_PATTERN = /^[a-z0-9_./*-]+$/;
+/** 0.3.0 recorded tool outputs only for "true": these words keep meaning "off" rather than naming a tool. */
+const TOOL_OUTPUT_OFF = new Set(['', 'false', '0', 'no', 'off', 'none', 'disabled']);
+/** …and these, which look like "every tool", recorded nothing either: off, with a warning that says to write true. */
+const TOOL_OUTPUT_ON_LOOKALIKES = new Set(['1', 'yes', 'on', 'enabled', 'all']);
 
 function resolveToolOutput(env: Env, warnings: string[]): ToolOutputCapture {
   const name = 'OTEL_CAPTURE_TOOL_OUTPUT';
   const raw = (env[name] ?? '').trim();
   const value = raw.toLowerCase();
-  if (value === '' || value === 'false') {
+  if (TOOL_OUTPUT_OFF.has(value)) {
     return { mode: 'none' };
   }
   if (value === 'true') {
     return { mode: 'all' };
+  }
+  if (TOOL_OUTPUT_ON_LOOKALIKES.has(value)) {
+    warnings.push(`Ignoring ${name}="${raw}": write "true" to record every tool's output; no tool output is recorded.`);
+    return { mode: 'none' };
   }
   const patterns = value.split(',').map((pattern) => pattern.trim());
   if (patterns.some((pattern) => !TOOL_NAME_PATTERN.test(pattern))) {
@@ -176,7 +186,13 @@ export function resolveTraceSettings(env: Env): TraceSettingsResolution {
     captureLlmToolSchemas = false;
   }
   const toolOutput = resolveToolOutput(env, warnings);
-  const llmMessageMaxChars = resolvePositiveInt(env, 'OTEL_LLM_MESSAGE_MAX_CHARS', DEFAULT_LLM_MESSAGE_MAX_CHARS, warnings);
+  const llmMessageMaxChars = resolvePositiveInt(
+    env,
+    'OTEL_LLM_MESSAGE_MAX_CHARS',
+    DEFAULT_LLM_MESSAGE_MAX_CHARS,
+    warnings,
+    MIN_LLM_MESSAGE_MAX_CHARS
+  );
   const llmMessagesMax = resolvePositiveInt(
     env,
     'OTEL_LLM_MESSAGES_MAX',
