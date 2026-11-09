@@ -126,6 +126,7 @@ deepseek-agent-acp
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
 | `ACP_MAX_ITERATIONS` | `15` (`25` for coder/builder) | Maximum model calls in one `session/prompt` turn, a positive integer (`BUZZ_MAX_ITERATIONS` is the fallback). Every tool call costs one iteration, so an agent that stays in one turn for minutes (a meeting call that loops on `meeting_wait`) must raise it. |
 | `MCP_TOOL_TIMEOUT_MS` | `60000` | Timeout for individual MCP tool calls (ms). |
+| `OTEL_*`, `PHOENIX_*` | *(unset: no tracing)* | Tracing to Arize Phoenix and what it records: see [Tracing](#-tracing-opentelemetry--arize-phoenix). |
 
 `thinking` and `reasoning_effort` are only added to the request when the matching variable is set, so endpoints
 that reject unknown fields keep working. Invalid values are ignored with a warning on stderr, and the effective
@@ -147,6 +148,70 @@ environment at start-up (see In-Memory Secret Sanitization).
 | `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors (the notice is streamed as text). |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls. A notice is streamed and the client may rotate the session. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
+
+---
+
+## 🔭 Tracing (OpenTelemetry → Arize Phoenix)
+
+Spans are exported (OTLP/HTTP protobuf) when `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` or `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set; `OTEL_SERVICE_NAME`, `PHOENIX_PROJECT_NAME` and `PHOENIX_API_KEY` name the service, the project and the key.
+Tracing is fail-open: Phoenix being slow or down never slows or breaks a turn.
+
+```text
+agent_turn (AGENT)          one ACP turn: input.value = the prompt, output.value = the answer, token totals
+├── llm:<model> (LLM)       one per model call: token counts, output.value = the text answer
+│                           + with OTEL_CAPTURE_LLM_MESSAGES=true: the exact request and the answer (below)
+├── tool:<name> (TOOL)      tool.parameters, tool.output_bytes; output.value for posting tools (posted event id)
+│                           + output.value for the tools named in OTEL_CAPTURE_TOOL_OUTPUT
+└── steer (CHAIN)           a message injected into the running turn
+```
+
+Everything beyond that is opt-in. With none of these variables set, every span is exactly what 0.3.0 wrote.
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `OTEL_CAPTURE_LLM_MESSAGES` | off | `true`: each LLM span records the exact request sent to DeepSeek and the model's answer. |
+| `OTEL_CAPTURE_LLM_TOOL_SCHEMAS` | off | `true` (with the above): also each tool's description and JSON schema. Large. |
+| `OTEL_CAPTURE_TOOL_OUTPUT` | off | `true`: every tool's output; or a comma-separated list of tool names with `*` wildcards, case-insensitive (`meeting_*,thread_read`). Empty, `false`, `0`, `no`, `off` or `none`: none. |
+| `OTEL_LLM_MESSAGE_MAX_CHARS` | `65536` | The longest recorded content or arguments string (64 or more); a longer one ends with `…[truncated N chars]`. |
+| `OTEL_LLM_MESSAGES_MAX` | `400` | The most messages per span: the first 2 and the newest `MAX-2` (3 or more); `llm.input_messages_omitted` says how many were left out. |
+| `OTEL_LLM_MESSAGES_MAX_TOTAL_CHARS` | `524288` | Budget for all recorded contents of one span: over it, the oldest middle contents (never the first 2 or the last 4) become `…[omitted for size]`; `llm.input_messages_trimmed` counts them. |
+
+An invalid value is ignored with a warning, and one line at start-up says what is recorded:
+
+```text
+[config] tracing llm_messages=on tool_schemas=off tool_output=meeting_* message_max_chars=65536 messages_max=400 messages_max_total_chars=524288 attribute_count_limit=4096 attribute_value_length_limit=65536 export_timeout_ms=10000 export_batch=32
+```
+
+**What a captured LLM span holds** ([OpenInference](https://github.com/Arize-ai/openinference/blob/main/spec/semantic_conventions.md) names; Phoenix shows the messages as a chat):
+
+- `llm.input_messages.<i>.message.role` / `.content` / `.tool_call_id` /
+  `.tool_calls.<j>.tool_call.{id,function.name,function.arguments}` — the messages exactly as sent, recorded right before
+  the request (a failed request still shows them). `reasoning_content` is never recorded.
+- `llm.input_messages_total`, and `llm.input_messages_omitted` / `llm.input_messages_trimmed` when above zero.
+- `llm.invocation_parameters` — the request body without messages and tools (model, temperature, thinking,
+  reasoning_effort, stream options). Never the API key or headers.
+- `llm.tools.<k>.tool.name` (+ `.description` and `.json_schema` with `OTEL_CAPTURE_LLM_TOOL_SCHEMAS=true`).
+- `llm.output_messages.0.message.*` — the answer: its text and tool calls, on every way the call ends (including what
+  had arrived when a stream broke or the turn was cancelled).
+
+`input.value` and `output.value` keep their meaning, so [buzz-trace](https://www.npmjs.com/package/buzz-trace) reads
+turns as before. A captured tool output is `output.value` with `output.mime_type` `application/json` when the recorded
+value is JSON, else `text/plain` (cut at 8 KB, as before); posting tools record their output as before.
+
+**Limits and size.** While anything is captured, the SDK keeps up to 4096 attributes per span and values up to
+`max(8192, OTEL_LLM_MESSAGE_MAX_CHARS, 8207)` characters (`OTEL_SPAN_ATTRIBUTE_COUNT_LIMIT` / `OTEL_ATTRIBUTE_COUNT_LIMIT`
+and `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` / `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT` override them), and the exporter gets
+10 s (`OTEL_EXPORTER_OTLP_TRACES_TIMEOUT` / `OTEL_EXPORTER_OTLP_TIMEOUT`) with batches of 32 spans. Without capture they
+stay 8192 characters, the SDK's 128 attributes, 1.5 s and 128 spans. Every call re-sends the whole history, so an LLM
+span holds the system prompt plus the conversation so far: with a 12 KB system prompt about 13–30 KB per span, about
+0.3–0.5 MB for a 10-minute call.
+
+**Privacy.** Message capture stores everything the model reads in Phoenix: the system prompt, people's words (a call's
+transcript), and every tool result. Known secrets are redacted before anything is cut — the API key and the tokens in
+the adapter's environment (exact match, also base64, and their beginning when a string stops part-way through one) and
+token formats such as `sk-…`, `glpat-…`, `ghp_…`, `nsec1…` and JWTs. Anything else is stored as it is. Turn capture on
+only where everyone who can open the Phoenix project may read those conversations.
 
 ---
 
