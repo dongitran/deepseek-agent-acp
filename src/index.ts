@@ -17,6 +17,13 @@ import { format } from 'node:util';
 import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
 import { McpClient } from './mcp-client.js';
 import {
+  PRESERVED_DEEPSEEK_CONFIG,
+  describeReasoning,
+  resolveIterationLimit,
+  resolveReasoningParams,
+  resolveRequestTimeoutMs
+} from './config.js';
+import {
   initTelemetry,
   registerSecret,
   parseNostrContext,
@@ -86,9 +93,9 @@ export function loadSecretKey(secretsPath = '/run/agent-secrets/env'): string {
   delete process.env.DEEPSEEK_AUTH_TOKEN;
   delete process.env.DEEPSEEK_TOKEN;
   delete process.env.DEEPSEEK_SECRET;
-  const preservedDeepseekConfig = new Set(['DEEPSEEK_BASE_URL', 'DEEPSEEK_MODEL', 'DEEPSEEK_TEMPERATURE']);
+  // Default-deny: any DEEPSEEK_* variable that is not a documented setting could be a secret.
   for (const envKey of Object.keys(process.env)) {
-    if (/^DEEPSEEK_/i.test(envKey) && !preservedDeepseekConfig.has(envKey)) {
+    if (/^DEEPSEEK_/i.test(envKey) && !PRESERVED_DEEPSEEK_CONFIG.has(envKey)) {
       delete process.env[envKey];
     }
   }
@@ -112,6 +119,19 @@ const BASE_URL = (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').r
 const MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-chat';
 const TEMPERATURE = parseFloat(process.env.DEEPSEEK_TEMPERATURE ?? '0.0');
 const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMMAND ?? 'buzz-dev-mcp';
+
+// Resolved once at start-up (after the secret purge, so every setting listed in PRESERVED_DEEPSEEK_CONFIG is intact).
+const REASONING = resolveReasoningParams(process.env);
+const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
+const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
+for (const warning of [...REASONING.warnings, ...ITERATION_LIMIT.warnings, ...REQUEST_TIMEOUT.warnings]) {
+  console.warn(warning);
+}
+console.info(
+  `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
+    `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()}`
+);
 
 // ============================================================================
 // 3. PROMPT ADAPTATION LAYER
@@ -147,21 +167,6 @@ function getSystemPrompt(model: string): string {
     }
   }
   return adaptSystemPrompt(raw, model);
-}
-
-function getIterationLimit(model: string): number {
-  const maxIterEnv = process.env.ACP_MAX_ITERATIONS ?? process.env.BUZZ_MAX_ITERATIONS;
-  if (maxIterEnv) {
-    const val = parseInt(maxIterEnv, 10);
-    if (!isNaN(val) && val > 0) {
-      return val;
-    }
-  }
-  const isCoder =
-    model.includes('coder') ||
-    process.env.AGENT_ROLE === 'coder' ||
-    process.env.AGENT_ROLE === 'builder';
-  return isCoder ? 25 : 15;
 }
 
 // ============================================================================
@@ -398,11 +403,13 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
   );
   session.activeTurnHandle = turnHandle ?? null;
 
-  const maxIterations = getIterationLimit(MODEL);
+  const maxIterations = ITERATION_LIMIT.limit;
   let iteration = 0;
   let lastToolError: string | null = null;
   let consecutiveErrorCount = 0;
   let turnCompleted = false;
+  // Why the loop ended when the model did not finish by itself: the while condition (iteration limit) unless the breaker fires.
+  let stoppedBy: 'iteration_limit' | 'circuit_breaker' = 'iteration_limit';
 
   try {
     const tools = await mcpClient.getTools();
@@ -438,8 +445,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         throw new Error('DEEPSEEK_API_KEY is missing or empty. Cannot authenticate with DeepSeek API.');
       }
 
-      // Call DeepSeek Chat Completions with Streaming with 90s request timeout
-      const requestTimeoutMs = parseInt(process.env.DEEPSEEK_REQUEST_TIMEOUT_MS ?? '90000', 10);
+      // Call DeepSeek Chat Completions with Streaming (request timeout: DEEPSEEK_REQUEST_TIMEOUT_MS, default 90s)
+      const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
       const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
       const combinedSignal = session.abortController
         ? AbortSignal.any([session.abortController.signal, timeoutSignal])
@@ -456,6 +463,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
           messages: messagesPayload,
           tools: tools && tools.length > 0 ? tools : undefined,
           temperature: TEMPERATURE,
+          // thinking / reasoning_effort: only present when DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT are set.
+          ...REASONING.params,
           stream: true,
           stream_options: { include_usage: true }
         }),
@@ -697,26 +706,45 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
           }
         }
         console.warn(`Circuit breaker triggered for session ${sessionId}. Ending turn.`);
+        stoppedBy = 'circuit_breaker';
         break;
       }
     }
 
     if (!turnCompleted) {
       session.commit();
-      const finalContent = iteration >= maxIterations
-        ? (session.messages[session.messages.length - 1]?.content ?? 'Turn reached maximum iteration limit.')
+      const hitIterationLimit = stoppedBy === 'iteration_limit';
+      const finalContent = hitIterationLimit
+        ? `Turn stopped after ${maxIterations.toString()} model iterations (ACP_MAX_ITERATIONS). Send a new message to continue.`
         : 'Turn execution stopped because repetitive tool errors occurred.';
+
+      if (hitIterationLimit) {
+        console.warn(
+          `[ITERATION LIMIT] Session ${sessionId} used all ${maxIterations.toString()} iterations of the turn. ` +
+            'Ending it with stopReason max_turn_requests.'
+        );
+        sendNotification('session/update', {
+          sessionId,
+          delta: {
+            type: 'text',
+            text: `\n\n*(Notice: iteration limit of ${maxIterations.toString()} reached; the turn was stopped.)*`
+          }
+        });
+      }
 
       turnHandle?.end('OK', finalContent);
       void telemetryService?.backgroundFlush();
 
+      // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
+      // protocol error that kills and respawns this process. An exhausted iteration budget is `max_turn_requests`;
+      // a circuit-breaker stop is a normal, committed end of turn.
       sendResponse(id, {
         sessionId,
         message: {
           role: 'assistant',
           content: finalContent
         },
-        stopReason: iteration >= maxIterations ? 'max_iterations' : 'loop_aborted'
+        stopReason: hitIterationLimit ? 'max_turn_requests' : 'end_turn'
       });
       sendNotification('session/turnComplete', { sessionId });
     }
@@ -746,6 +774,9 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       }
     });
 
+    // Known deviation, left as is: `error` is not an ACP stop reason. buzz-acp treats it as a protocol error and
+    // answers by respawning this process and re-queueing the prompt with backoff, which is the retry that transient
+    // API failures (HTTP 429/5xx, timeouts) currently get. Moving to a JSON-RPC error needs that retry decided first.
     sendResponse(id, {
       sessionId,
       message: {

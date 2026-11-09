@@ -24,6 +24,11 @@ function spawnAdapter(env = {}) {
   const responses = [];
   const notifications = [];
   let buffer = '';
+  let stderrText = '';
+
+  child.stderr.on('data', (chunk) => {
+    stderrText += chunk.toString();
+  });
 
   child.stdout.on('data', (chunk) => {
     buffer += chunk.toString();
@@ -65,7 +70,68 @@ function spawnAdapter(env = {}) {
     });
   };
 
-  return { child, send, waitResponse, responses, notifications };
+  return { child, send, waitResponse, responses, notifications, getStderr: () => stderrText };
+}
+
+const SSE_HEADERS = {
+  'Content-Type': 'text/event-stream',
+  'Cache-Control': 'no-cache',
+  Connection: 'keep-alive'
+};
+
+/**
+ * Starts a mock /chat/completions endpoint that records every parsed request body.
+ * `onRequest(body, res, callNumber)` writes the reply.
+ */
+async function startMockCompletions(onRequest) {
+  const requests = [];
+  const server = http.createServer((req, res) => {
+    if (req.url !== '/chat/completions') {
+      res.writeHead(404);
+      res.end();
+      return;
+    }
+    let raw = '';
+    req.on('data', (chunk) => {
+      raw += chunk;
+    });
+    req.on('end', () => {
+      const body = JSON.parse(raw);
+      requests.push(body);
+      onRequest(body, res, requests.length);
+    });
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  return { server, requests, baseUrl: `http://127.0.0.1:${server.address().port}` };
+}
+
+function replyText(res, text) {
+  res.writeHead(200, SSE_HEADERS);
+  res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: text }, finish_reason: 'stop' }] })}\n\n`);
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+/** A tool call whose arguments are not JSON; every call n yields a different error text (no circuit breaker). */
+function replyUnparsableToolCall(res, n) {
+  res.writeHead(200, SSE_HEADERS);
+  const delta = {
+    tool_calls: [{ index: 0, id: `call_${n}`, type: 'function', function: { name: 'bad_tool', arguments: `BAD_${n}` } }]
+  };
+  res.write(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`);
+  res.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+async function promptOnce(adapter, id, text = 'hello') {
+  adapter.send({
+    jsonrpc: '2.0',
+    id,
+    method: 'session/prompt',
+    params: { sessionId: `sess-${id}`, prompt: text }
+  });
+  return adapter.waitResponse(id, 5000);
 }
 
 test('ACP initialize returns protocolVersion 1 and capabilities', async () => {
@@ -300,7 +366,8 @@ test('Circuit breaker aborts when 2 consecutive identical tool errors occur', as
 
     const res = await waitResponse(30, 5000);
     assert.equal(res.id, 30);
-    assert.equal(res.result.stopReason, 'loop_aborted');
+    // A circuit-breaker stop is a normal, spec-valid end of turn: buzz-acp treats any other value as a protocol error.
+    assert.equal(res.result.stopReason, 'end_turn');
 
     const loopNotice = notifications.find(
       (n) => n.method === 'session/update' && n.params?.delta?.text?.includes('Tool execution loop aborted')
@@ -488,7 +555,7 @@ test('Circuit breaker: injects synthetic tool error for remaining unexecuted too
 
     const res = await waitResponse(40, 5000);
     assert.equal(res.id, 40);
-    assert.equal(res.result.stopReason, 'loop_aborted');
+    assert.equal(res.result.stopReason, 'end_turn');
 
     send({
       jsonrpc: '2.0',
@@ -680,5 +747,207 @@ test('ACP _session/steering injects follow-up into running turn', async () => {
   } finally {
     child.kill();
     server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Thinking control: DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT must reach the request
+// (they used to be purged from process.env at start-up and never read).
+// ---------------------------------------------------------------------------
+
+test('Request carries no thinking or reasoning_effort when nothing is configured', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl });
+  try {
+    await promptOnce(adapter, 60);
+    assert.equal(mock.requests.length, 1);
+    assert.equal('thinking' in mock.requests[0], false);
+    assert.equal('reasoning_effort' in mock.requests[0], false);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('DEEPSEEK_THINKING=disabled is sent as thinking.type=disabled', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, DEEPSEEK_THINKING: 'disabled' });
+  try {
+    await promptOnce(adapter, 61);
+    assert.deepEqual(mock.requests[0].thinking, { type: 'disabled' });
+    assert.equal('reasoning_effort' in mock.requests[0], false);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('DEEPSEEK_REASONING_EFFORT=none disables thinking', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, DEEPSEEK_REASONING_EFFORT: 'none' });
+  try {
+    await promptOnce(adapter, 62);
+    assert.deepEqual(mock.requests[0].thinking, { type: 'disabled' });
+    assert.equal('reasoning_effort' in mock.requests[0], false);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('DEEPSEEK_REASONING_EFFORT=max is sent as reasoning_effort', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, DEEPSEEK_REASONING_EFFORT: 'max' });
+  try {
+    await promptOnce(adapter, 63);
+    assert.equal(mock.requests[0].reasoning_effort, 'max');
+    assert.equal('thinking' in mock.requests[0], false);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('An invalid DEEPSEEK_THINKING value is ignored and reported on stderr', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, DEEPSEEK_THINKING: 'banana' });
+  try {
+    await promptOnce(adapter, 64);
+    assert.equal('thinking' in mock.requests[0], false);
+    assert.match(adapter.getStderr(), /DEEPSEEK_THINKING/);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('The start-up log states the effective model, reasoning mode and iteration limit', async () => {
+  const mock = await startMockCompletions((body, res) => replyText(res, 'ok'));
+  const adapter = spawnAdapter({
+    DEEPSEEK_BASE_URL: mock.baseUrl,
+    DEEPSEEK_MODEL: 'deepseek-flash',
+    DEEPSEEK_THINKING: 'disabled',
+    ACP_MAX_ITERATIONS: '10000'
+  });
+  try {
+    await promptOnce(adapter, 65);
+    const log = adapter.getStderr();
+    assert.match(log, /\[config\] model=deepseek-flash/);
+    assert.match(log, /thinking=disabled/);
+    assert.match(log, /max_iterations=10000/);
+    assert.match(log, /Turn iteration 1\/10000/);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Settings that used to be purged together with the secrets
+// ---------------------------------------------------------------------------
+
+test('DEEPSEEK_REQUEST_TIMEOUT_MS is honoured (the secret purge must not remove it)', async () => {
+  const hanging = http.createServer(() => {
+    /* never answers */
+  });
+  await new Promise((resolve) => hanging.listen(0, '127.0.0.1', resolve));
+  const adapter = spawnAdapter({
+    DEEPSEEK_BASE_URL: `http://127.0.0.1:${hanging.address().port}`,
+    DEEPSEEK_REQUEST_TIMEOUT_MS: '400'
+  });
+  try {
+    adapter.send({
+      jsonrpc: '2.0',
+      id: 66,
+      method: 'session/prompt',
+      params: { sessionId: 'timeout-sess', prompt: 'hello' }
+    });
+    const res = await adapter.waitResponse(66, 4000);
+    assert.match(res.result.message.content, /timeout|aborted/i);
+  } finally {
+    adapter.child.kill();
+    hanging.closeAllConnections();
+    hanging.close();
+  }
+});
+
+test('loadSecretKey purges secrets and unknown DEEPSEEK_* variables but keeps every documented setting', async () => {
+  const verifyCode = `
+    import { loadSecretKey } from '${INDEX_PATH}';
+    process.env.DEEPSEEK_API_KEY = 'secret';
+    process.env.DEEPSEEK_SOMETHING_ELSE = 'unknown-might-be-a-secret';
+    process.env.DEEPSEEK_THINKING = 'disabled';
+    process.env.DEEPSEEK_REASONING_EFFORT = 'none';
+    process.env.DEEPSEEK_REQUEST_TIMEOUT_MS = '1234';
+    loadSecretKey();
+    const gone = ['DEEPSEEK_API_KEY', 'DEEPSEEK_SOMETHING_ELSE'].filter((k) => process.env[k] !== undefined);
+    const kept = {
+      DEEPSEEK_THINKING: 'disabled',
+      DEEPSEEK_REASONING_EFFORT: 'none',
+      DEEPSEEK_REQUEST_TIMEOUT_MS: '1234'
+    };
+    const lost = Object.keys(kept).filter((k) => process.env[k] !== kept[k]);
+    if (gone.length || lost.length) {
+      console.error(JSON.stringify({ notPurged: gone, lostSettings: lost }));
+      process.exit(1);
+    }
+    process.exit(0);
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', verifyCode], {
+    env: { ...process.env, NODE_PATH: NODE_MODULES_PATH }
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d.toString();
+  });
+  const exitCode = await new Promise((res) => child.on('exit', res));
+  assert.equal(exitCode, 0, `purge check failed: ${stderr}`);
+});
+
+// ---------------------------------------------------------------------------
+// Iteration limit
+// ---------------------------------------------------------------------------
+
+test('Iteration limit ends the turn with the ACP stop reason max_turn_requests and a fixed notice', async () => {
+  const mock = await startMockCompletions((body, res, n) => replyUnparsableToolCall(res, n));
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, ACP_MAX_ITERATIONS: '3' });
+  try {
+    const res = await promptOnce(adapter, 67, 'keep calling tools');
+    // buzz-acp rejects any stop reason outside the ACP set ("unknown stopReason") by respawning the agent.
+    assert.equal(res.result.stopReason, 'max_turn_requests');
+    assert.equal(mock.requests.length, 3, 'exactly ACP_MAX_ITERATIONS model calls');
+    assert.match(res.result.message.content, /3/, 'the notice names the limit');
+    assert.doesNotMatch(res.result.message.content, /malformed JSON|BAD_/, 'raw tool output must not be returned as the answer');
+    const notice = adapter.notifications.find(
+      (n) => n.method === 'session/update' && /iteration limit/i.test(n.params?.delta?.text ?? '')
+    );
+    assert.ok(notice, 'Expected an iteration limit notice in the update stream');
+    assert.match(adapter.getStderr(), /Turn iteration 3\/3/);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
+  }
+});
+
+test('A circuit-breaker stop on the last allowed iteration is reported as a breaker stop, not as the limit', async () => {
+  // Two identical failing calls: the breaker fires on iteration 2, which is also ACP_MAX_ITERATIONS.
+  const mock = await startMockCompletions((body, res) => {
+    res.writeHead(200, SSE_HEADERS);
+    const delta = {
+      tool_calls: [{ index: 0, id: 'call_same', type: 'function', function: { name: 'bad_tool', arguments: 'NOT_VALID_JSON' } }]
+    };
+    res.write(`data: ${JSON.stringify({ choices: [{ delta }] })}\n\n`);
+    res.write('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n\n');
+    res.write('data: [DONE]\n\n');
+    res.end();
+  });
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, ACP_MAX_ITERATIONS: '2' });
+  try {
+    const res = await promptOnce(adapter, 68, 'loop');
+    assert.equal(res.result.stopReason, 'end_turn');
+    assert.match(res.result.message.content, /repetitive tool errors/);
+  } finally {
+    adapter.child.kill();
+    mock.server.close();
   }
 });

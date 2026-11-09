@@ -81,8 +81,9 @@ It bridges headless orchestrators, team chat relays, and multi-agent harnesses w
 4. **Transactional State Management & Rollback**:
    * Takes atomic message snapshots before executing each turn.
    * Restores session state seamlessly to the last stable checkpoint upon client cancellation (`session/cancel`) or uncaught runtime exceptions.
-5. **Execution Circuit Breaker**:
+5. **Execution Circuit Breaker and Turn Limit**:
    * Detects stagnant loops (e.g., 2 consecutive identical tool failures).
+   * Caps the model calls per turn (`ACP_MAX_ITERATIONS`) and ends an exhausted turn with the ACP stop reason `max_turn_requests`.
    * Injects synthetic safeguards for remaining unexecuted tool calls to maintain strict OpenAI tool-call response invariants.
 6. **Full Model Context Protocol (MCP) Integration**:
    * Discovers tools dynamically from connected MCP servers and translates them to OpenAI function schemas.
@@ -115,14 +116,37 @@ deepseek-agent-acp
 | Variable | Default | Description |
 | :--- | :--- | :--- |
 | `DEEPSEEK_API_KEY` | *(Required)* | DeepSeek API key (or `DEEPSEEK_AUTH_TOKEN`). |
-| `DEEPSEEK_MODEL` | `deepseek-chat` | Target model (`deepseek-chat`, `deepseek-reasoner`). |
+| `DEEPSEEK_MODEL` | `deepseek-chat` | Target model (for example `deepseek-flash`, `deepseek-chat`, `deepseek-reasoner`). |
 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | Base endpoint URL for completions API. |
 | `DEEPSEEK_TEMPERATURE` | `0.0` | Sampling temperature. |
-| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | HTTP fetch and chunk read timeout (ms). |
+| `DEEPSEEK_THINKING` | *(unset: API default)* | `enabled` or `disabled`, sent as `thinking.type`. DeepSeek models think by default, so set `disabled` for a zero-thinking agent. |
+| `DEEPSEEK_REASONING_EFFORT` | *(unset: API default)* | `none` (turns thinking off) or `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, sent as `reasoning_effort`. `DEEPSEEK_THINKING=disabled` wins over any level. |
+| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | HTTP fetch and chunk read timeout (ms). A positive integer. |
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
-| `ACP_MAX_ITERATIONS` | `15` (`25` for coder) | Maximum autonomous tool execution turn iterations. |
+| `ACP_MAX_ITERATIONS` | `15` (`25` for coder/builder) | Maximum model calls in one `session/prompt` turn, a positive integer (`BUZZ_MAX_ITERATIONS` is the fallback). Every tool call costs one iteration, so an agent that stays in one turn for minutes (a meeting call that loops on `meeting_wait`) must raise it. |
 | `MCP_TOOL_TIMEOUT_MS` | `60000` | Timeout for individual MCP tool calls (ms). |
+
+`thinking` and `reasoning_effort` are only added to the request when the matching variable is set, so endpoints
+that reject unknown fields keep working. Invalid values are ignored with a warning on stderr, and the effective
+settings are logged once at start-up:
+
+```text
+[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000
+```
+
+Every `DEEPSEEK_*` variable that is not a setting listed above is treated as a secret and removed from the process
+environment at start-up (see In-Memory Secret Sanitization).
+
+### Stop reasons
+
+`session/prompt` always ends with an ACP stop reason, so clients such as buzz-acp never see a protocol error:
+
+| `stopReason` | When |
+| :--- | :--- |
+| `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors (the notice is streamed as text). |
+| `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls. A notice is streamed and the client may rotate the session. |
+| `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
 
 ---
 
