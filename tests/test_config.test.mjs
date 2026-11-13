@@ -8,7 +8,8 @@ const {
   PRESERVED_DEEPSEEK_CONFIG,
   resolveReasoningParams,
   resolveIterationLimit,
-  resolveRequestTimeoutMs
+  resolveRequestTimeoutMs,
+  resolveWrapupIterations
 } = await import(path.resolve(__dirname, '../dist/config.js'));
 
 // ---------------------------------------------------------------------------
@@ -184,5 +185,32 @@ test('resolveRequestTimeoutMs: invalid values fall back to the default with a wa
     assert.equal(resolved.timeoutMs, 90000, `"${bad}" must not be accepted`);
     assert.equal(resolved.warnings.length, 1);
     assert.match(resolved.warnings[0], /DEEPSEEK_REQUEST_TIMEOUT_MS/);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Wrap-up calls after a stopped turn
+// ---------------------------------------------------------------------------
+
+test('resolveWrapupIterations: unset or empty is 2, with no warning', () => {
+  assert.deepEqual(resolveWrapupIterations({}), { iterations: 2, warnings: [] });
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: '' }), { iterations: 2, warnings: [] });
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: '  ' }), { iterations: 2, warnings: [] });
+});
+
+test('resolveWrapupIterations: 0 turns the wrap-up off and 1..5 are honoured (spaces trimmed)', () => {
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: '0' }), { iterations: 0, warnings: [] });
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: '1' }), { iterations: 1, warnings: [] });
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: ' 3 ' }), { iterations: 3, warnings: [] });
+  assert.deepEqual(resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: '5' }), { iterations: 5, warnings: [] });
+});
+
+test('resolveWrapupIterations: anything else falls back to 2 with a warning naming the variable', () => {
+  for (const bad of ['6', '100', '-1', '1.5', '02', 'two', '1e1']) {
+    const resolved = resolveWrapupIterations({ ACP_WRAPUP_ITERATIONS: bad });
+    assert.equal(resolved.iterations, 2, `"${bad}" must not be accepted`);
+    assert.equal(resolved.warnings.length, 1);
+    assert.match(resolved.warnings[0], /ACP_WRAPUP_ITERATIONS/);
+    assert.ok(resolved.warnings[0].includes(`"${bad}"`), 'the warning quotes the value it ignored');
   }
 });

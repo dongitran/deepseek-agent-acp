@@ -181,3 +181,34 @@ export function resolveRequestTimeoutMs(env: Env): RequestTimeoutResolution {
   }
   return { timeoutMs: value, warnings: [] };
 }
+
+export const DEFAULT_WRAPUP_ITERATIONS = 2;
+export const MAX_WRAPUP_ITERATIONS = 5;
+
+export interface WrapupIterationsResolution {
+  iterations: number;
+  warnings: string[];
+}
+
+/**
+ * ACP_WRAPUP_ITERATIONS: the model calls a turn still gets after the adapter stopped it (circuit breaker, iteration
+ * limit), so the model can tell the person why (src/turn-stop.ts). 0 turns the wrap-up off; at most 5, since the
+ * wrap-up is a last word, not more work. Two leave room for reading the thread, then replying.
+ */
+export function resolveWrapupIterations(env: Env): WrapupIterationsResolution {
+  const raw = (env.ACP_WRAPUP_ITERATIONS ?? '').trim();
+  if (raw === '') {
+    return { iterations: DEFAULT_WRAPUP_ITERATIONS, warnings: [] };
+  }
+  const value = raw === '0' ? 0 : parsePositiveInt(raw);
+  if (value === null || value > MAX_WRAPUP_ITERATIONS) {
+    return {
+      iterations: DEFAULT_WRAPUP_ITERATIONS,
+      warnings: [
+        `Ignoring ACP_WRAPUP_ITERATIONS="${raw}": expected an integer from 0 to ${MAX_WRAPUP_ITERATIONS.toString()}; ` +
+          `using ${DEFAULT_WRAPUP_ITERATIONS.toString()}.`
+      ]
+    };
+  }
+  return { iterations: value, warnings: [] };
+}
