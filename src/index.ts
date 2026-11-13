@@ -636,8 +636,29 @@ function reportBreakerTrip(ctx: TurnContext, toolName: string, breaker: ToolErro
   });
 }
 
+/**
+ * ACP `tool_call`: a tool call starts. buzz-acp restarts its idle clock on it — a turn that only calls tools (a meeting
+ * call's meeting_wait loop) wrote nothing else to stdout — and records an agent step for the owner. Title only: the
+ * arguments never leave the adapter this way.
+ */
+function sendToolCallStarted(sessionId: string, toolCallId: string, name: string): void {
+  sendNotification('session/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call', toolCallId, title: name.slice(0, 64), kind: 'other', status: 'in_progress' }
+  });
+}
+
+/** ACP `tool_call_update`: the call ended, `failed` when its result is an error or it did not run. */
+function sendToolCallFinished(sessionId: string, toolCallId: string, failed: boolean): void {
+  sendNotification('session/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call_update', toolCallId, status: failed ? 'failed' : 'completed' }
+  });
+}
+
 /** A tool call that does not run (malformed arguments, a tool the wrap-up does not offer): a failed span and result. */
 function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void {
+  sendToolCallStarted(ctx.sessionId, tc.id, tc.function.name);
   ctx.turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
   ctx.turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
   ctx.session.messages.push({
@@ -645,6 +666,7 @@ function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void
     tool_call_id: tc.id,
     content: JSON.stringify({ error: errorMsg })
   });
+  sendToolCallFinished(ctx.sessionId, tc.id, true);
 }
 
 /**
@@ -699,6 +721,7 @@ async function executeToolCalls(
 
     const argsPreview = JSON.stringify(parsedArgs).slice(0, 150);
     console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
+    sendToolCallStarted(sessionId, tc.id, tc.function.name);
     turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
     const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
     console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
@@ -723,6 +746,7 @@ async function executeToolCalls(
     }
 
     turnHandle?.endToolSpan(tc.id, toolResult, Boolean(errorString), tc.function.name);
+    sendToolCallFinished(sessionId, tc.id, Boolean(errorString));
     if (!errorString && extractPostedEventId(toolResult)) {
       posted = true;
     }

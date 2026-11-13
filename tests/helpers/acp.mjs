@@ -72,8 +72,8 @@ export async function waitFor(find, timeoutMs, what = 'the adapter') {
 /**
  * Runs `prompts` in order on one session. `reply(res, n, body)` answers the n-th chat-completions request (1-based).
  * `onPrompt(index, { send, stdout })` runs after a prompt is sent and before its response is awaited.
- * Returns the responses (in prompt order), every notification, the request bodies, the tools the MCP server ran,
- * stderr, and — with `trace: true` — the spans Phoenix received.
+ * Returns the responses (in prompt order), every stdout message in order and its notifications, the request bodies, the
+ * tools the MCP server ran, stderr, and — with `trace: true` — the spans Phoenix received.
  */
 export async function runAdapter({ env = {}, prompts = ['Join the call'], reply, onPrompt, trace = false }) {
   const requests = [];
@@ -145,6 +145,7 @@ export async function runAdapter({ env = {}, prompts = ['Join the call'], reply,
     const calls = fs.existsSync(callLog) ? fs.readFileSync(callLog, 'utf8').split('\n').filter(Boolean) : [];
     return {
       responses,
+      messages: messages(),
       notifications: messages().filter((message) => message.method),
       requests,
       calls,

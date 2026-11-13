@@ -186,3 +186,76 @@ test('a turn the model finishes stays OK, with no wrap-up attribute anywhere', a
     }
   }
 });
+
+// ---------------------------------------------------------------------------
+// ACP tool calls: buzz-acp sees each step (its idle clock restarts; the owner sees the agent's steps)
+// ---------------------------------------------------------------------------
+
+/** The ACP tool-call updates on stdout, in order, each with its position among all stdout messages. */
+const toolCallUpdates = (run) =>
+  run.messages
+    .map((message, at) => ({ at, message }))
+    .filter(({ message }) => message.method === 'session/update' && message.params?.update)
+    .map(({ at, message }) => ({ at, sessionId: message.params.sessionId, ...message.params.update }));
+
+test('each tool call is reported as an ACP tool_call, then a tool_call_update', async () => {
+  const run = await runAdapter({
+    reply: (res, n) =>
+      sse(
+        res,
+        n === 1
+          ? toolCalls([
+              { id: 'call_w', name: 'meeting_wait', args: '{}' },
+              { id: 'call_t', name: 'thread_read', args: '{}' }
+            ])
+          : text('Chào bạn!')
+      )
+  });
+  const updates = toolCallUpdates(run);
+  assert.deepEqual(
+    updates.map(({ at: _at, sessionId: _sessionId, ...update }) => update),
+    [
+      { sessionUpdate: 'tool_call', toolCallId: 'call_w', title: 'meeting_wait', kind: 'other', status: 'in_progress' },
+      { sessionUpdate: 'tool_call_update', toolCallId: 'call_w', status: 'completed' },
+      { sessionUpdate: 'tool_call', toolCallId: 'call_t', title: 'thread_read', kind: 'other', status: 'in_progress' },
+      { sessionUpdate: 'tool_call_update', toolCallId: 'call_t', status: 'completed' }
+    ]
+  );
+  assert.ok(updates.every((update) => update.sessionId === SESSION_ID));
+  const responseAt = run.messages.findIndex((message) => message.id === 1);
+  assert.ok(updates.every((update) => update.at < responseAt), 'every step is reported before the turn ends');
+});
+
+test('a failing, a malformed and a refused call each end failed; a call never attempted is not reported', async () => {
+  const run = await runAdapter({
+    env: JOIN_FAILS,
+    reply: (res, n) => {
+      if (n === 1) {
+        return sse(res, join(1));
+      }
+      if (n === 2) {
+        // The join trips the breaker: the meeting_wait after it never runs.
+        return sse(res, toolCalls([
+          { id: 'call_2', name: 'meeting_join', args: '{"url":"https://meet.google.com/abc-defg-hij"}' },
+          { id: 'call_2b', name: 'meeting_wait', args: '{}' }
+        ]));
+      }
+      if (n === 3) {
+        // In the wrap-up: the tool that tripped the breaker (refused), and arguments that are not JSON.
+        return sse(res, toolCalls([
+          { id: 'call_3', name: 'meeting_join', args: '{"url":"https://meet.google.com/abc-defg-hij"}' },
+          { id: 'call_3b', name: 'thread_read', args: 'NOT_VALID_JSON' }
+        ]));
+      }
+      return sse(res, text('Sorry.'));
+    }
+  });
+  const updates = toolCallUpdates(run);
+  const statuses = {};
+  for (const update of updates) {
+    (statuses[update.toolCallId] ??= []).push(`${update.sessionUpdate}:${update.status}`);
+  }
+  const failed = ['tool_call:in_progress', 'tool_call_update:failed'];
+  assert.deepEqual(statuses, { call_1: failed, call_2: failed, call_3: failed, call_3b: failed });
+  assert.deepEqual(run.calls, ['meeting_join', 'meeting_join'], 'only the two joins ran');
+});
