@@ -7,8 +7,9 @@
  * - In-memory secret loading and sanitization (strips API key from process.env immediately).
  * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
  * - Transactional state checkpointing and rollback on session/cancel.
- * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row).
- * - Full Model Context Protocol (MCP) tool execution.
+ * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row), then a wrap-up in
+ *   which the model tells the person why the turn stopped (src/turn-stop.ts).
+ * - Full Model Context Protocol (MCP) tool execution, each tool call reported as ACP tool_call / tool_call_update.
  */
 
 import fs from 'node:fs';

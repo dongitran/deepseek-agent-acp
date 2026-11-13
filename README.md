@@ -85,9 +85,12 @@ It bridges headless orchestrators, team chat relays, and multi-agent harnesses w
    * Detects stagnant loops (e.g., 2 consecutive identical tool failures).
    * Caps the model calls per turn (`ACP_MAX_ITERATIONS`) and ends an exhausted turn with the ACP stop reason `max_turn_requests`.
    * Injects synthetic safeguards for remaining unexecuted tool calls to maintain strict OpenAI tool-call response invariants.
+   * Before a turn it stopped ends, gives the model a short wrap-up to tell the person who asked why
+     ([When the adapter stops a turn](#when-the-adapter-stops-a-turn)).
 6. **Full Model Context Protocol (MCP) Integration**:
    * Discovers tools dynamically from connected MCP servers and translates them to OpenAI function schemas.
    * Automatically sanitizes child process environments while preserving required authorization tokens and signing keys.
+   * Reports every tool call to the client as ACP `tool_call` / `tool_call_update` updates.
 
 ---
 
@@ -125,6 +128,7 @@ deepseek-agent-acp
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
 | `ACP_MAX_ITERATIONS` | `15` (`25` for coder/builder) | Maximum model calls in one `session/prompt` turn, a positive integer (`BUZZ_MAX_ITERATIONS` is the fallback). Every tool call costs one iteration, so an agent that stays in one turn for minutes (a meeting call that loops on `meeting_wait`) must raise it. |
+| `ACP_WRAPUP_ITERATIONS` | `2` | Model calls a turn still gets after the circuit breaker or the iteration limit stopped it, so the model can tell the person why: an integer from 0 to 5, `0` turns the wrap-up off. See [When the adapter stops a turn](#when-the-adapter-stops-a-turn). |
 | `MCP_TOOL_TIMEOUT_MS` | `60000` | Timeout for individual MCP tool calls (ms). |
 | `OTEL_*`, `PHOENIX_*` | *(unset: no tracing)* | Tracing to Arize Phoenix and what it records: see [Tracing](#-tracing-opentelemetry--arize-phoenix). |
 
@@ -133,7 +137,7 @@ that reject unknown fields keep working. Invalid values are ignored with a warni
 settings are logged once at start-up:
 
 ```text
-[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000
+[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 wrapup_iterations=2
 ```
 
 Every `DEEPSEEK_*` variable that is not a setting listed above is treated as a secret and removed from the process
@@ -145,9 +149,31 @@ environment at start-up (see In-Memory Secret Sanitization).
 
 | `stopReason` | When |
 | :--- | :--- |
-| `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors (the notice is streamed as text). |
-| `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls. A notice is streamed and the client may rotate the session. |
+| `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
+| `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
+
+### When the adapter stops a turn
+
+The circuit breaker (2 identical tool errors in a row) and the iteration limit stop a turn the model has not finished.
+A client such as buzz-acp relays nothing the agent writes as text: the agent reaches people only through its tools (a
+reply tool, speech in a call, the `buzz` CLI). Ended there, such a turn would leave the person who asked without a
+word. So the model first gets a **wrap-up**: up to `ACP_WRAPUP_ITERATIONS` (default 2) more model calls, after one
+user message from the adapter that starts with `[deepseek-agent-acp: this turn is being stopped]`. It says why the
+turn stops and asks the model to tell the person who asked, in one short message, the way it normally answers them,
+and then stop.
+
+- **Tools.** After the breaker, every tool except those whose calls failed identically: the model cannot loop on them,
+  and a call to a tool the wrap-up does not offer is not run (its result says so). After the iteration limit, every
+  tool. `tool_choice` is never sent: DeepSeek refuses `required` and named choices in thinking mode, the API default.
+- **No quoting.** The notice never repeats the error text. A tool's output stays in its tool message, as data, and
+  never becomes an instruction from the user.
+- **End.** The wrap-up ends at its budget, on an answer without tool calls, once a tool posted a message (a Buzz
+  event id in its output, so it never posts twice), or when its own breaker trips.
+- **Failure.** If a wrap-up call fails (HTTP error, timeout), the turn ends exactly as the stop ended it: committed,
+  with the same stop reason, without the notice. A `session/cancel` during the wrap-up rolls the whole turn back, as
+  for any cancelled turn.
+- `ACP_WRAPUP_ITERATIONS=0` ends a stopped turn at once, as 0.4.0 did.
 
 ---
 
@@ -159,6 +185,7 @@ Tracing is fail-open: Phoenix being slow or down never slows or breaks a turn.
 
 ```text
 agent_turn (AGENT)          one ACP turn: input.value = the prompt, output.value = the answer, token totals
+│                           status ERROR when the adapter stopped it (below)
 ├── llm:<model> (LLM)       one per model call: token counts, output.value = the text answer
 │                           + with OTEL_CAPTURE_LLM_MESSAGES=true: the exact request and the answer (below)
 ├── tool:<name> (TOOL)      tool.parameters, tool.output_bytes; output.value for posting tools (posted event id)
@@ -166,7 +193,12 @@ agent_turn (AGENT)          one ACP turn: input.value = the prompt, output.value
 └── steer (CHAIN)           a message injected into the running turn
 ```
 
-Everything beyond that is opt-in. With none of these variables set, every span is exactly what 0.3.0 wrote.
+A turn the adapter stopped ends with status ERROR: `error.kind` is `circuit_breaker` or `iteration_limit`,
+`error.message` names the tools or the limit, and `deepseek.wrapup.iterations` counts the wrap-up's model calls, whose
+LLM spans carry `deepseek.wrapup = true`. A message the wrap-up posted links the turn by `nostr.posted_event_id`.
+
+Everything beyond that is opt-in. With none of these variables set, every span of a turn the model finishes is exactly
+what 0.3.0 wrote.
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |
@@ -225,6 +257,9 @@ only where everyone who can open the Phoenix project may read those conversation
 
 ### Notifications
 * **`session/update`**: Emits real-time stream deltas (`type: "thought"` for reasoning, `type: "text"` for content).
+* **`session/update`** (ACP `update.sessionUpdate`): `tool_call` when a tool call starts (`title` = the tool's name,
+  `kind` `other`, `status` `in_progress`), then `tool_call_update` when it ends (`completed` or `failed`). No arguments
+  or outputs are sent. A client sees each step, and buzz-acp restarts its idle clock on it.
 * **`session/turnComplete`**: Signals the clean completion of a prompt turn.
 
 ---
