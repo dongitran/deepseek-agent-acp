@@ -910,7 +910,8 @@ test('loadSecretKey purges secrets and unknown DEEPSEEK_* variables but keeps ev
 
 test('Iteration limit ends the turn with the ACP stop reason max_turn_requests and a fixed notice', async () => {
   const mock = await startMockCompletions((body, res, n) => replyUnparsableToolCall(res, n));
-  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, ACP_MAX_ITERATIONS: '3' });
+  // No wrap-up: this pins the limit itself (tests/test_wrapup.test.mjs covers the calls after it).
+  const adapter = spawnAdapter({ DEEPSEEK_BASE_URL: mock.baseUrl, ACP_MAX_ITERATIONS: '3', ACP_WRAPUP_ITERATIONS: '0' });
   try {
     const res = await promptOnce(adapter, 67, 'keep calling tools');
     // buzz-acp rejects any stop reason outside the ACP set ("unknown stopReason") by respawning the agent.

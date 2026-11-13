@@ -7,31 +7,46 @@
  * - In-memory secret loading and sanitization (strips API key from process.env immediately).
  * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
  * - Transactional state checkpointing and rollback on session/cancel.
- * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row).
- * - Full Model Context Protocol (MCP) tool execution.
+ * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row), then a wrap-up in
+ *   which the model tells the person why the turn stopped (src/turn-stop.ts).
+ * - Full Model Context Protocol (MCP) tool execution, each tool call reported as ACP tool_call / tool_call_update.
  */
 
 import fs from 'node:fs';
 import readline from 'node:readline';
 import { format } from 'node:util';
 import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
-import { McpClient } from './mcp-client.js';
+import { McpClient, type OpenAIFunctionTool } from './mcp-client.js';
 import {
   PRESERVED_DEEPSEEK_CONFIG,
   describeReasoning,
   resolveIterationLimit,
   resolveReasoningParams,
-  resolveRequestTimeoutMs
+  resolveRequestTimeoutMs,
+  resolveWrapupIterations
 } from './config.js';
 import {
+  extractPostedEventId,
   initTelemetry,
   registerSecret,
   parseNostrContext,
   type LlmSpanHandle,
+  type LlmSpanOptions,
   type TelemetryService,
   type TurnSpanHandle
 } from './telemetry.js';
 import { describeTraceSettings, resolveTraceSettings } from './trace-config.js';
+import {
+  ToolErrorBreaker,
+  breakerStop,
+  describeTurnStop,
+  isRepeatOfFailedCall,
+  refusedToolError,
+  stopMessageOf,
+  stopReasonOf,
+  wrapupNotice,
+  type TurnStop
+} from './turn-stop.js';
 import type {
   ChatMessage,
   JSONRPCRequest,
@@ -128,13 +143,19 @@ const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMM
 const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
-for (const warning of [...REASONING.warnings, ...ITERATION_LIMIT.warnings, ...REQUEST_TIMEOUT.warnings]) {
+const WRAPUP = resolveWrapupIterations(process.env);
+for (const warning of [
+  ...REASONING.warnings,
+  ...ITERATION_LIMIT.warnings,
+  ...REQUEST_TIMEOUT.warnings,
+  ...WRAPUP.warnings
+]) {
   console.warn(warning);
 }
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()}`
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} wrapup_iterations=${WRAPUP.iterations.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
 if (telemetryService) {
@@ -383,6 +404,485 @@ export function extractPromptText(params?: Record<string, unknown>): string {
   return '';
 }
 
+// ============================================================================
+// 5.1 ONE TURN, STEP BY STEP
+// A turn is model calls (callModel) and the tool calls each answer asks for (executeToolCalls), until the model answers
+// without a tool call, the circuit breaker trips, or the iteration limit is reached.
+// ============================================================================
+
+/** What the steps of one turn share: the request being answered, its session and its trace. */
+interface TurnContext {
+  id: string | number | undefined;
+  sessionId: string;
+  session: Session;
+  turnHandle: TurnSpanHandle | undefined;
+}
+
+/** One model call's answer: what streamed in, the assistant message built from it, and its LLM span, still open. */
+interface ModelAnswer {
+  accumulator: StreamAccumulator;
+  assistantMsg: ChatMessage;
+  llmSpan: LlmSpanHandle | undefined;
+}
+
+/** session/cancel aborts the turn's controller and clears it. */
+function wasCancelled(session: Session): boolean {
+  return Boolean(session.abortController?.signal?.aborted) || !session.abortController;
+}
+
+/** A cancelled turn makes no further call. */
+function throwIfCancelled(session: Session): void {
+  if (wasCancelled(session)) {
+    throw new Error('Turn was aborted by cancellation signal.');
+  }
+}
+
+/**
+ * One streamed chat-completions call on the session's messages. Text and reasoning deltas go out as session/update.
+ * Throws when the key is missing, the API refuses the request, or the stream breaks or is cancelled.
+ */
+async function callModel(
+  ctx: TurnContext,
+  tools: OpenAIFunctionTool[],
+  iteration: number,
+  options?: LlmSpanOptions
+): Promise<ModelAnswer> {
+  const { session, sessionId, turnHandle } = ctx;
+  const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration, options);
+
+  // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
+  const messagesPayload = session.messages.map((m) => {
+    const msg: ChatMessage = {
+      role: m.role,
+      content: m.content
+    };
+    if (m.reasoning_content) {
+      msg.reasoning_content = m.reasoning_content;
+    }
+    if (m.tool_calls) {
+      msg.tool_calls = m.tool_calls;
+    }
+    if (m.tool_call_id) {
+      msg.tool_call_id = m.tool_call_id;
+    }
+    return msg;
+  });
+
+  if (!DEEPSEEK_API_KEY) {
+    throw new Error('DEEPSEEK_API_KEY is missing or empty. Cannot authenticate with DeepSeek API.');
+  }
+
+  // Call DeepSeek Chat Completions with Streaming (request timeout: DEEPSEEK_REQUEST_TIMEOUT_MS, default 90s)
+  const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
+  const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
+  const combinedSignal = session.abortController
+    ? AbortSignal.any([session.abortController.signal, timeoutSignal])
+    : timeoutSignal;
+
+  const requestBody = {
+    model: MODEL,
+    messages: messagesPayload,
+    tools: tools && tools.length > 0 ? tools : undefined,
+    temperature: TEMPERATURE,
+    // thinking / reasoning_effort: only present when DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT are set.
+    ...REASONING.params,
+    stream: true,
+    stream_options: { include_usage: true }
+  };
+  // OTEL_CAPTURE_LLM_MESSAGES: recorded before the request, so a failed request still shows what was sent.
+  llmSpan?.recordRequest(requestBody);
+
+  const response = await fetch(`${BASE_URL}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${DEEPSEEK_API_KEY}`
+    },
+    body: JSON.stringify(requestBody),
+    signal: combinedSignal
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    llmSpan?.end(undefined, `DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
+    throw new Error(`DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
+  }
+
+  // Stream accumulator for 3-phase events
+  let accumulator: StreamAccumulator | null = null;
+
+  try {
+    for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+      if (session.abortController?.signal?.aborted || !session.abortController) {
+        recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
+        llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
+        throw new Error('Stream aborted by client cancellation.');
+      }
+
+      if (event.type === 'delta') {
+        if (event.reasoningDelta) {
+          sendNotification('session/update', {
+            sessionId,
+            delta: {
+              type: 'thought',
+              text: event.reasoningDelta
+            }
+          });
+        }
+        if (event.contentDelta) {
+          sendNotification('session/update', {
+            sessionId,
+            delta: {
+              type: 'text',
+              text: event.contentDelta
+            }
+          });
+        }
+      }
+      if (event.accumulator) {
+        accumulator = event.accumulator as StreamAccumulator;
+      }
+    }
+  } catch (streamErr: unknown) {
+    // The stream broke half-way (read timeout, reset): the turn's end closes this span; keep what had arrived.
+    recordPartialAnswer(llmSpan, accumulator);
+    throw streamErr;
+  }
+
+  if (!accumulator) {
+    accumulator = new StreamAccumulator();
+  }
+
+  if (accumulator.usage) {
+    llmSpan?.recordUsage(accumulator.usage);
+    turnHandle?.recordUsage(accumulator.usage);
+  }
+
+  // Build assistant message
+  const assistantMsg: ChatMessage = {
+    role: 'assistant',
+    content: accumulator.content || null
+  };
+
+  if (accumulator.reasoningContent) {
+    assistantMsg.reasoning_content = accumulator.reasoningContent;
+  }
+  return { accumulator, assistantMsg, llmSpan };
+}
+
+/**
+ * Truncated Stream / Synthetic Tool Error: the answer stopped at the token limit (finish_reason === 'length') in the
+ * middle of its tool calls. None of them runs; each gets an error result so the model can self-correct.
+ */
+function recordTruncatedToolCalls(ctx: TurnContext, answer: ModelAnswer): void {
+  const { accumulator, assistantMsg, llmSpan } = answer;
+  console.warn(`[SAFE STREAM] finish_reason === 'length' on tool call. Injecting synthetic tool error.`);
+  llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: accumulator.toolCalls });
+  llmSpan?.end(undefined, 'Tool execution truncated due to token limits.');
+  assistantMsg.tool_calls = accumulator.toolCalls.map((tc) => ({
+    id: tc.id,
+    type: 'function',
+    function: {
+      name: tc.function.name,
+      arguments: tc.function.arguments
+    }
+  }));
+  ctx.session.messages.push(assistantMsg);
+
+  for (const tc of accumulator.toolCalls) {
+    ctx.session.messages.push({
+      role: 'tool',
+      tool_call_id: tc.id,
+      content: JSON.stringify({
+        error: 'Tool execution truncated due to token limits. Do not execute partial command; please simplify or break down your request.'
+      })
+    });
+  }
+
+  sendNotification('session/update', {
+    sessionId: ctx.sessionId,
+    delta: {
+      type: 'text',
+      text: '\n\n*(Notice: Output reached max token length. Incomplete tool parameters have been safeguarded.)*'
+    }
+  });
+}
+
+/** An answer without tool calls: the model's last word in the turn. */
+function recordFinalAnswer(ctx: TurnContext, answer: ModelAnswer): void {
+  const { accumulator, assistantMsg, llmSpan } = answer;
+  llmSpan?.recordOutput({ content: accumulator.content || null });
+  llmSpan?.end(accumulator.content || undefined);
+  ctx.session.messages.push(assistantMsg);
+}
+
+/** An answer with tool calls: close its LLM span before the tools run. */
+function recordToolCallAnswer(ctx: TurnContext, answer: ModelAnswer, toolCalls: ToolCall[]): void {
+  const { accumulator, assistantMsg, llmSpan } = answer;
+  llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: toolCalls });
+  llmSpan?.end(accumulator.content || undefined);
+  assistantMsg.tool_calls = toolCalls;
+  ctx.session.messages.push(assistantMsg);
+}
+
+/** The breaker tripped on `toolName`: say so on stderr and in the update stream. */
+function reportBreakerTrip(ctx: TurnContext, toolName: string, breaker: ToolErrorBreaker): void {
+  console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${toolName}'.`);
+  sendNotification('session/update', {
+    sessionId: ctx.sessionId,
+    delta: {
+      type: 'text',
+      text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${breaker.lastError ?? ''})*`
+    }
+  });
+}
+
+/**
+ * ACP `tool_call`: a tool call starts. buzz-acp restarts its idle clock on it — a turn that only calls tools (a meeting
+ * call's meeting_wait loop) wrote nothing else to stdout — and records an agent step for the owner. Title only: the
+ * arguments never leave the adapter this way.
+ */
+function sendToolCallStarted(sessionId: string, toolCallId: string, name: string): void {
+  sendNotification('session/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call', toolCallId, title: name.slice(0, 64), kind: 'other', status: 'in_progress' }
+  });
+}
+
+/** ACP `tool_call_update`: the call ended, `failed` when its result is an error or it did not run. */
+function sendToolCallFinished(sessionId: string, toolCallId: string, failed: boolean): void {
+  sendNotification('session/update', {
+    sessionId,
+    update: { sessionUpdate: 'tool_call_update', toolCallId, status: failed ? 'failed' : 'completed' }
+  });
+}
+
+/** A tool call that does not run (malformed arguments, a tool the wrap-up does not offer): a failed span and result. */
+function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void {
+  sendToolCallStarted(ctx.sessionId, tc.id, tc.function.name);
+  ctx.turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
+  ctx.turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
+  ctx.session.messages.push({
+    role: 'tool',
+    tool_call_id: tc.id,
+    content: JSON.stringify({ error: errorMsg })
+  });
+  sendToolCallFinished(ctx.sessionId, tc.id, true);
+}
+
+/**
+ * Runs one answer's tool calls in order through MCP, each result appended as a tool message. Circuit breaker: when a
+ * result makes 2 identical tool errors in a row, the rest do not run and get a synthetic error result instead (every
+ * tool call must have a result), and `tripped` is true. In a wrap-up, a call `refuse` matches (a repeat of a call that
+ * tripped the breaker) does not run. `executed` counts the calls MCP ran; `posted` says one of them posted a Buzz message.
+ */
+async function executeToolCalls(
+  ctx: TurnContext,
+  toolCalls: ToolCall[],
+  breaker: ToolErrorBreaker,
+  refuse: ((tc: ToolCall) => boolean) | null = null
+): Promise<{ tripped: boolean; executed: number; posted: boolean }> {
+  const { session, sessionId, turnHandle } = ctx;
+  let tripped = false;
+  let executed = 0;
+  let posted = false;
+  const executedToolCallIds = new Set<string>();
+
+  for (const tc of toolCalls) {
+    if (refuse?.(tc)) {
+      console.warn(`[WRAP-UP] Not running ${tc.function.name}: the same call already failed twice in a row.`);
+      const errorMsg = refusedToolError(tc.function.name);
+      recordUnrunCall(ctx, tc, errorMsg);
+      executedToolCallIds.add(tc.id);
+      if (breaker.record(tc.function.name, tc.function.arguments, errorMsg)) {
+        reportBreakerTrip(ctx, tc.function.name, breaker);
+        tripped = true;
+        break;
+      }
+      continue;
+    }
+
+    let parsedArgs: Record<string, unknown> = {};
+    try {
+      parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
+    } catch (parseErr: unknown) {
+      const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
+      console.warn(`JSON parse error on tool arguments for ${tc.function.name}: ${msg}`);
+      const errorMsg = `Tool execution truncated due to token limits: malformed JSON arguments (${msg})`;
+      recordUnrunCall(ctx, tc, errorMsg);
+      executedToolCallIds.add(tc.id);
+
+      if (breaker.record(tc.function.name, tc.function.arguments, errorMsg)) {
+        reportBreakerTrip(ctx, tc.function.name, breaker);
+        tripped = true;
+        break;
+      }
+      continue;
+    }
+
+    const argsPreview = JSON.stringify(parsedArgs).slice(0, 150);
+    console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
+    sendToolCallStarted(sessionId, tc.id, tc.function.name);
+    turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
+    const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
+    console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
+    executed++;
+
+    session.messages.push({
+      role: 'tool',
+      tool_call_id: tc.id,
+      content: toolResult
+    });
+    executedToolCallIds.add(tc.id);
+
+    // Check if output represents a tool error
+    let errorString: string | null = null;
+    try {
+      const parsedOut = JSON.parse(toolResult) as { error?: unknown };
+      if (parsedOut && parsedOut.error) {
+        errorString = typeof parsedOut.error === 'string' ? parsedOut.error : JSON.stringify(parsedOut.error);
+      }
+    } catch {
+      // Ignored
+    }
+
+    turnHandle?.endToolSpan(tc.id, toolResult, Boolean(errorString), tc.function.name);
+    sendToolCallFinished(sessionId, tc.id, Boolean(errorString));
+    if (!errorString && extractPostedEventId(toolResult)) {
+      posted = true;
+    }
+
+    if (breaker.record(tc.function.name, tc.function.arguments, errorString)) {
+      reportBreakerTrip(ctx, tc.function.name, breaker);
+      tripped = true;
+      break;
+    }
+  }
+
+  if (tripped) {
+    // Ensure any remaining unexecuted tool calls have synthetic error responses injected
+    for (const tc of toolCalls) {
+      if (!executedToolCallIds.has(tc.id)) {
+        session.messages.push({
+          role: 'tool',
+          tool_call_id: tc.id,
+          content: JSON.stringify({
+            error: 'Tool execution aborted: loop breaker stopped execution before this tool could run. (circuit breaker stopped execution before this tool could run)'
+          })
+        });
+        executedToolCallIds.add(tc.id);
+      }
+    }
+    console.warn(`Circuit breaker triggered for session ${sessionId}. Ending turn.`);
+  }
+  return { tripped, executed, posted };
+}
+
+/**
+ * The wrap-up of a turn the adapter stopped (src/turn-stop.ts): up to ACP_WRAPUP_ITERATIONS more model calls after a
+ * notice that says why, so the model tells the person who asked. Every tool stays offered, but a repeat of a call that
+ * tripped the breaker does not run; it ends at the budget, on an answer without tool calls, on a posted message or when
+ * its own breaker trips. A failed call ends it and keeps what already ran; a cancel goes to the turn's cancel path.
+ */
+async function runWrapup(
+  ctx: TurnContext,
+  stop: TurnStop,
+  tools: OpenAIFunctionTool[],
+  iteration: number
+): Promise<{ iterations: number; toolCalls: number }> {
+  const budget = WRAPUP.iterations;
+  if (budget === 0) {
+    return { iterations: 0, toolCalls: 0 };
+  }
+  const { session, sessionId } = ctx;
+  const refuse = (tc: ToolCall): boolean => isRepeatOfFailedCall(stop, tc.function.name, tc.function.arguments);
+  const notice: ChatMessage = { role: 'user', content: wrapupNotice(stop) };
+  session.messages.push(notice);
+  console.info(
+    `[WRAP-UP] Session ${sessionId}: ${describeTurnStop(stop)}; giving the model up to ${budget.toString()} call(s) ` +
+      'to tell the person.'
+  );
+
+  const breaker = new ToolErrorBreaker();
+  let calls = 0;
+  let toolCalls = 0;
+  let posted = false;
+  try {
+    while (calls < budget) {
+      throwIfCancelled(session);
+      calls++;
+      console.info(`Wrap-up call ${calls.toString()}/${budget.toString()} for session ${sessionId}`);
+      const answer = await callModel(ctx, tools, iteration + calls, { wrapup: true });
+
+      if (answer.accumulator.isTruncated() && answer.accumulator.toolCalls.length > 0) {
+        recordTruncatedToolCalls(ctx, answer);
+        continue;
+      }
+      const validToolCalls: ToolCall[] = answer.accumulator.getValidToolCalls();
+      if (validToolCalls.length === 0) {
+        recordFinalAnswer(ctx, answer);
+        break;
+      }
+      recordToolCallAnswer(ctx, answer, validToolCalls);
+      const run = await executeToolCalls(ctx, validToolCalls, breaker, refuse);
+      toolCalls += run.executed;
+      if (run.posted) {
+        // The person has been told: another call could only post twice.
+        posted = true;
+        break;
+      }
+      if (run.tripped) {
+        break;
+      }
+    }
+  } catch (err: unknown) {
+    if (wasCancelled(session)) {
+      throw err;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[WRAP-UP] Session ${sessionId}: the wrap-up failed (${msg}); ending the turn without it.`);
+    // A notice nothing answered would stay a user message that the next prompt follows: take it out.
+    const at = session.messages.indexOf(notice);
+    if (at !== -1 && !session.messages.slice(at + 1).some((message) => message.role === 'assistant')) {
+      session.messages.splice(at, 1);
+    }
+  }
+  console.info(
+    `[WRAP-UP] Session ${sessionId}: ended after ${calls.toString()} call(s), ${toolCalls.toString()} tool call(s)` +
+      `${posted ? ', posted' : ''}.`
+  );
+  return { iterations: calls, toolCalls };
+}
+
+/**
+ * Ends a turn the adapter stopped: committed, answered with an ACP stop reason, and traced as failed — the model did not
+ * finish it, whatever the wrap-up said (agent-infra #49: these turns showed as OK in Phoenix).
+ */
+function endStoppedTurn(ctx: TurnContext, stop: TurnStop, wrapup: { iterations: number }): void {
+  const { id, session, sessionId, turnHandle } = ctx;
+  // A cancel that came while the last tool call ran (the turn's or the wrap-up's) must roll the turn back, not commit
+  // the result that call pushed onto the restored history: the turn's catch does that.
+  throwIfCancelled(session);
+  session.commit();
+  const content = stopMessageOf(stop);
+  turnHandle?.recordWrapup(wrapup.iterations);
+  turnHandle?.end('ERROR', content, stop.reason, describeTurnStop(stop));
+  void telemetryService?.backgroundFlush();
+
+  // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
+  // protocol error that kills and respawns this process. An exhausted iteration budget is `max_turn_requests`;
+  // a circuit-breaker stop is a normal, committed end of turn.
+  sendResponse(id, {
+    sessionId,
+    message: {
+      role: 'assistant',
+      content
+    },
+    stopReason: stopReasonOf(stop)
+  });
+  sendNotification('session/turnComplete', { sessionId });
+}
+
 /**
  * Handle ACP session/prompt execution with multi-turn tool loops.
  */
@@ -420,200 +920,47 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
     nostrMeta
   );
   session.activeTurnHandle = turnHandle ?? null;
+  const ctx: TurnContext = { id, sessionId, session, turnHandle };
 
   const maxIterations = ITERATION_LIMIT.limit;
   let iteration = 0;
-  let lastToolError: string | null = null;
-  let consecutiveErrorCount = 0;
-  let turnCompleted = false;
-  // Why the loop ended when the model did not finish by itself: the while condition (iteration limit) unless the breaker fires.
-  let stoppedBy: 'iteration_limit' | 'circuit_breaker' = 'iteration_limit';
+  // Set when the breaker stops the loop; a loop that ends otherwise has used every iteration.
+  let stop: TurnStop | null = null;
 
   try {
     const tools = await mcpClient.getTools();
+    // Circuit breaker: 2 identical tool errors in a row, counted across the turn's iterations.
+    const breaker = new ToolErrorBreaker();
 
     while (iteration < maxIterations) {
-      if (session.abortController?.signal?.aborted || !session.abortController) {
-        throw new Error('Turn was aborted by cancellation signal.');
-      }
+      throwIfCancelled(session);
 
       iteration++;
       console.info(`Turn iteration ${iteration.toString()}/${maxIterations.toString()} for session ${sessionId}`);
-      const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration);
+      const answer = await callModel(ctx, tools, iteration);
 
-      // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
-      const messagesPayload = session.messages.map((m) => {
-        const msg: ChatMessage = {
-          role: m.role,
-          content: m.content
-        };
-        if (m.reasoning_content) {
-          msg.reasoning_content = m.reasoning_content;
-        }
-        if (m.tool_calls) {
-          msg.tool_calls = m.tool_calls;
-        }
-        if (m.tool_call_id) {
-          msg.tool_call_id = m.tool_call_id;
-        }
-        return msg;
-      });
-
-      if (!DEEPSEEK_API_KEY) {
-        throw new Error('DEEPSEEK_API_KEY is missing or empty. Cannot authenticate with DeepSeek API.');
-      }
-
-      // Call DeepSeek Chat Completions with Streaming (request timeout: DEEPSEEK_REQUEST_TIMEOUT_MS, default 90s)
-      const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
-      const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
-      const combinedSignal = session.abortController
-        ? AbortSignal.any([session.abortController.signal, timeoutSignal])
-        : timeoutSignal;
-
-      const requestBody = {
-        model: MODEL,
-        messages: messagesPayload,
-        tools: tools && tools.length > 0 ? tools : undefined,
-        temperature: TEMPERATURE,
-        // thinking / reasoning_effort: only present when DEEPSEEK_THINKING / DEEPSEEK_REASONING_EFFORT are set.
-        ...REASONING.params,
-        stream: true,
-        stream_options: { include_usage: true }
-      };
-      // OTEL_CAPTURE_LLM_MESSAGES: recorded before the request, so a failed request still shows what was sent.
-      llmSpan?.recordRequest(requestBody);
-
-      const response = await fetch(`${BASE_URL}/chat/completions`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${DEEPSEEK_API_KEY}`
-        },
-        body: JSON.stringify(requestBody),
-        signal: combinedSignal
-      });
-
-      if (!response.ok) {
-        const errorText = await response.text();
-        llmSpan?.end(undefined, `DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
-        throw new Error(`DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
-      }
-
-      // Stream accumulator for 3-phase events
-      let accumulator: StreamAccumulator | null = null;
-
-      try {
-        for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
-          if (session.abortController?.signal?.aborted || !session.abortController) {
-            recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
-            llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
-            throw new Error('Stream aborted by client cancellation.');
-          }
-
-          if (event.type === 'delta') {
-            if (event.reasoningDelta) {
-              sendNotification('session/update', {
-                sessionId,
-                delta: {
-                  type: 'thought',
-                  text: event.reasoningDelta
-                }
-              });
-            }
-            if (event.contentDelta) {
-              sendNotification('session/update', {
-                sessionId,
-                delta: {
-                  type: 'text',
-                  text: event.contentDelta
-                }
-              });
-            }
-          }
-          if (event.accumulator) {
-            accumulator = event.accumulator as StreamAccumulator;
-          }
-        }
-      } catch (streamErr: unknown) {
-        // The stream broke half-way (read timeout, reset): the turn's end closes this span; keep what had arrived.
-        recordPartialAnswer(llmSpan, accumulator);
-        throw streamErr;
-      }
-
-      if (!accumulator) {
-        accumulator = new StreamAccumulator();
-      }
-
-      if (accumulator.usage) {
-        llmSpan?.recordUsage(accumulator.usage);
-        turnHandle?.recordUsage(accumulator.usage);
-      }
-
-      // Build assistant message
-      const assistantMsg: ChatMessage = {
-        role: 'assistant',
-        content: accumulator.content || null
-      };
-
-      if (accumulator.reasoningContent) {
-        assistantMsg.reasoning_content = accumulator.reasoningContent;
-      }
-
-      // Truncated Stream / Synthetic Tool Error
-      if (accumulator.isTruncated() && accumulator.toolCalls.length > 0) {
-        console.warn(`[SAFE STREAM] finish_reason === 'length' on tool call. Injecting synthetic tool error.`);
-        llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: accumulator.toolCalls });
-        llmSpan?.end(undefined, 'Tool execution truncated due to token limits.');
-        assistantMsg.tool_calls = accumulator.toolCalls.map((tc) => ({
-          id: tc.id,
-          type: 'function',
-          function: {
-            name: tc.function.name,
-            arguments: tc.function.arguments
-          }
-        }));
-        session.messages.push(assistantMsg);
-
-        for (const tc of accumulator.toolCalls) {
-          session.messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: JSON.stringify({
-              error: 'Tool execution truncated due to token limits. Do not execute partial command; please simplify or break down your request.'
-            })
-          });
-        }
-
-        sendNotification('session/update', {
-          sessionId,
-          delta: {
-            type: 'text',
-            text: '\n\n*(Notice: Output reached max token length. Incomplete tool parameters have been safeguarded.)*'
-          }
-        });
-
+      if (answer.accumulator.isTruncated() && answer.accumulator.toolCalls.length > 0) {
         // Let model self-correct on next turn iteration
+        recordTruncatedToolCalls(ctx, answer);
         continue;
       }
 
-      const validToolCalls: ToolCall[] = accumulator.getValidToolCalls();
+      const validToolCalls: ToolCall[] = answer.accumulator.getValidToolCalls();
 
       // No tool calls means the model produced its final response text
       if (validToolCalls.length === 0) {
-        llmSpan?.recordOutput({ content: accumulator.content || null });
-        llmSpan?.end(accumulator.content || undefined);
-        session.messages.push(assistantMsg);
+        recordFinalAnswer(ctx, answer);
         session.commit();
-        turnCompleted = true;
 
-        turnHandle?.end('OK', accumulator.content || '');
+        const content = answer.accumulator.content || '';
+        turnHandle?.end('OK', content);
         void telemetryService?.backgroundFlush();
 
         sendResponse(id, {
           sessionId,
           message: {
             role: 'assistant',
-            content: accumulator.content || ''
+            content
           },
           stopReason: 'end_turn'
         });
@@ -622,164 +969,31 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       }
 
       // Tool calls were produced: close current iteration's LLM span before executing tools
-      llmSpan?.recordOutput({ content: accumulator.content || null, tool_calls: validToolCalls });
-      llmSpan?.end(accumulator.content || undefined);
-      assistantMsg.tool_calls = validToolCalls;
-      session.messages.push(assistantMsg);
-
-      let loopAborted = false;
-      const executedToolCallIds = new Set<string>();
-
-      // Tool Execution & Circuit Breaker: Abort if 2 identical tool errors occur in a row.
-      for (const tc of validToolCalls) {
-        let parsedArgs: Record<string, unknown> = {};
-        try {
-          parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
-        } catch (parseErr: unknown) {
-          const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
-          console.warn(`JSON parse error on tool arguments for ${tc.function.name}: ${msg}`);
-          const errorMsg = `Tool execution truncated due to token limits: malformed JSON arguments (${msg})`;
-          turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
-          turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
-          session.messages.push({
-            role: 'tool',
-            tool_call_id: tc.id,
-            content: JSON.stringify({ error: errorMsg })
-          });
-          executedToolCallIds.add(tc.id);
-
-          if (lastToolError === errorMsg) {
-            consecutiveErrorCount++;
-          } else {
-            lastToolError = errorMsg;
-            consecutiveErrorCount = 1;
-          }
-
-          if (consecutiveErrorCount >= 2) {
-            console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${tc.function.name}'.`);
-            sendNotification('session/update', {
-              sessionId,
-              delta: {
-                type: 'text',
-                text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${lastToolError})*`
-              }
-            });
-            loopAborted = true;
-            break;
-          }
-          continue;
-        }
-
-        const argsPreview = JSON.stringify(parsedArgs).slice(0, 150);
-        console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
-        turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
-        const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
-        console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
-
-        session.messages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
-          content: toolResult
-        });
-        executedToolCallIds.add(tc.id);
-
-        // Check if output represents a tool error
-        let errorString: string | null = null;
-        try {
-          const parsedOut = JSON.parse(toolResult) as { error?: unknown };
-          if (parsedOut && parsedOut.error) {
-            errorString = typeof parsedOut.error === 'string' ? parsedOut.error : JSON.stringify(parsedOut.error);
-          }
-        } catch {
-          // Ignored
-        }
-
-        turnHandle?.endToolSpan(tc.id, toolResult, Boolean(errorString), tc.function.name);
-
-        if (errorString) {
-          if (lastToolError === errorString) {
-            consecutiveErrorCount++;
-          } else {
-            lastToolError = errorString;
-            consecutiveErrorCount = 1;
-          }
-        } else {
-          lastToolError = null;
-          consecutiveErrorCount = 0;
-        }
-
-        // Circuit breaker: Abort if 2 identical tool errors occur in a row
-        if (consecutiveErrorCount >= 2) {
-          console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${tc.function.name}'.`);
-          sendNotification('session/update', {
-            sessionId,
-            delta: {
-              type: 'text',
-              text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${lastToolError})*`
-            }
-          });
-          loopAborted = true;
-          break;
-        }
-      }
-
-      if (loopAborted) {
-        // Ensure any remaining unexecuted tool calls have synthetic error responses injected
-        for (const tc of validToolCalls) {
-          if (!executedToolCallIds.has(tc.id)) {
-            session.messages.push({
-              role: 'tool',
-              tool_call_id: tc.id,
-              content: JSON.stringify({
-                error: 'Tool execution aborted: loop breaker stopped execution before this tool could run. (circuit breaker stopped execution before this tool could run)'
-              })
-            });
-            executedToolCallIds.add(tc.id);
-          }
-        }
-        console.warn(`Circuit breaker triggered for session ${sessionId}. Ending turn.`);
-        stoppedBy = 'circuit_breaker';
+      recordToolCallAnswer(ctx, answer, validToolCalls);
+      const { tripped } = await executeToolCalls(ctx, validToolCalls, breaker);
+      if (tripped) {
+        stop = breakerStop(breaker);
         break;
       }
     }
 
-    if (!turnCompleted) {
-      session.commit();
-      const hitIterationLimit = stoppedBy === 'iteration_limit';
-      const finalContent = hitIterationLimit
-        ? `Turn stopped after ${maxIterations.toString()} model iterations (ACP_MAX_ITERATIONS). Send a new message to continue.`
-        : 'Turn execution stopped because repetitive tool errors occurred.';
-
-      if (hitIterationLimit) {
-        console.warn(
-          `[ITERATION LIMIT] Session ${sessionId} used all ${maxIterations.toString()} iterations of the turn. ` +
-            'Ending it with stopReason max_turn_requests.'
-        );
-        sendNotification('session/update', {
-          sessionId,
-          delta: {
-            type: 'text',
-            text: `\n\n*(Notice: iteration limit of ${maxIterations.toString()} reached; the turn was stopped.)*`
-          }
-        });
-      }
-
-      turnHandle?.end('OK', finalContent);
-      void telemetryService?.backgroundFlush();
-
-      // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
-      // protocol error that kills and respawns this process. An exhausted iteration budget is `max_turn_requests`;
-      // a circuit-breaker stop is a normal, committed end of turn.
-      sendResponse(id, {
+    // The model did not finish the turn: the breaker stopped it, or it used every iteration of it.
+    const stopped: TurnStop = stop ?? { reason: 'iteration_limit', limit: maxIterations };
+    if (stopped.reason === 'iteration_limit') {
+      console.warn(
+        `[ITERATION LIMIT] Session ${sessionId} used all ${maxIterations.toString()} iterations of the turn. ` +
+          'Ending it with stopReason max_turn_requests.'
+      );
+      sendNotification('session/update', {
         sessionId,
-        message: {
-          role: 'assistant',
-          content: finalContent
-        },
-        stopReason: hitIterationLimit ? 'max_turn_requests' : 'end_turn'
+        delta: {
+          type: 'text',
+          text: `\n\n*(Notice: iteration limit of ${maxIterations.toString()} reached; the turn was stopped.)*`
+        }
       });
-      sendNotification('session/turnComplete', { sessionId });
     }
+    const wrapup = await runWrapup(ctx, stopped, tools, iteration);
+    endStoppedTurn(ctx, stopped, wrapup);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Turn execution error in session ${sessionId}: ${msg}`);

@@ -601,12 +601,20 @@ export interface SteerSpanParams {
   priority?: 'now' | 'later';
 }
 
+/** What an LLM span is, beyond its model and iteration. */
+export interface LlmSpanOptions {
+  /** A call of the wrap-up after the adapter stopped the turn (src/turn-stop.ts): `deepseek.wrapup` on the span. */
+  wrapup?: boolean;
+}
+
 export interface TurnSpanHandle {
-  startLlmSpan(modelName: string, iteration?: number): LlmSpanHandle;
+  startLlmSpan(modelName: string, iteration?: number, options?: LlmSpanOptions): LlmSpanHandle;
   startToolSpan(toolCallId: string, toolName: string, toolParams: unknown): void;
   endToolSpan(toolCallId: string, output?: unknown, isError?: boolean, toolName?: string): void;
   recordSteerSpan(params: SteerSpanParams): void;
   recordUsage(usage: DeepSeekUsage): void;
+  /** How many model calls the wrap-up of a stopped turn made: `deepseek.wrapup.iterations` on the turn's span. */
+  recordWrapup(iterations: number): void;
   end(
     status: 'OK' | 'ERROR' | 'CANCELLED',
     outputOrError?: string,
@@ -808,7 +816,7 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
         let capturedStrings = new Map<string, string>();
 
         return {
-          startLlmSpan(llmModel: string, iteration = 1): LlmSpanHandle {
+          startLlmSpan(llmModel: string, iteration = 1, spanOptions?: LlmSpanOptions): LlmSpanHandle {
             const effectiveModel = llmModel || modelName || process.env.DEEPSEEK_MODEL || 'deepseek-chat';
             const llmSpan = tracer.startSpan(`llm:${effectiveModel}`, {
               attributes: {
@@ -818,7 +826,8 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                 'llm.provider': 'deepseek',
                 'llm.iteration': iteration,
                 'input.value': sanitizedPrompt,
-                'input.mime_type': 'text/plain'
+                'input.mime_type': 'text/plain',
+                ...(spanOptions?.wrapup ? { 'deepseek.wrapup': true } : {})
               }
             }, rootContext);
 
@@ -1018,6 +1027,10 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
               'steer.priority': steerParams.priority ?? 'now',
               'steer.delivered': true
             });
+          },
+
+          recordWrapup(iterations: number): void {
+            rootSpan.setAttribute('deepseek.wrapup.iterations', iterations);
           },
 
           recordUsage(usage: DeepSeekUsage): void {
