@@ -21,9 +21,11 @@ import {
   describeReasoning,
   resolveIterationLimit,
   resolveReasoningParams,
-  resolveRequestTimeoutMs
+  resolveRequestTimeoutMs,
+  resolveWrapupIterations
 } from './config.js';
 import {
+  extractPostedEventId,
   initTelemetry,
   registerSecret,
   parseNostrContext,
@@ -32,7 +34,17 @@ import {
   type TurnSpanHandle
 } from './telemetry.js';
 import { describeTraceSettings, resolveTraceSettings } from './trace-config.js';
-import { ToolErrorBreaker } from './turn-stop.js';
+import {
+  ToolErrorBreaker,
+  breakerStop,
+  describeTurnStop,
+  refusedToolError,
+  stopMessageOf,
+  stopReasonOf,
+  wrapupNotice,
+  wrapupTools,
+  type TurnStop
+} from './turn-stop.js';
 import type {
   ChatMessage,
   JSONRPCRequest,
@@ -129,13 +141,19 @@ const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMM
 const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
-for (const warning of [...REASONING.warnings, ...ITERATION_LIMIT.warnings, ...REQUEST_TIMEOUT.warnings]) {
+const WRAPUP = resolveWrapupIterations(process.env);
+for (const warning of [
+  ...REASONING.warnings,
+  ...ITERATION_LIMIT.warnings,
+  ...REQUEST_TIMEOUT.warnings,
+  ...WRAPUP.warnings
+]) {
   console.warn(warning);
 }
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()}`
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} wrapup_iterations=${WRAPUP.iterations.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
 if (telemetryService) {
@@ -405,9 +423,14 @@ interface ModelAnswer {
   llmSpan: LlmSpanHandle | undefined;
 }
 
-/** session/cancel aborts the turn's controller and clears it: the turn makes no further call. */
+/** session/cancel aborts the turn's controller and clears it. */
+function wasCancelled(session: Session): boolean {
+  return Boolean(session.abortController?.signal?.aborted) || !session.abortController;
+}
+
+/** A cancelled turn makes no further call. */
 function throwIfCancelled(session: Session): void {
-  if (session.abortController?.signal?.aborted || !session.abortController) {
+  if (wasCancelled(session)) {
     throw new Error('Turn was aborted by cancellation signal.');
   }
 }
@@ -607,21 +630,49 @@ function reportBreakerTrip(ctx: TurnContext, toolName: string, breaker: ToolErro
   });
 }
 
+/** A tool call that does not run (malformed arguments, a tool the wrap-up does not offer): a failed span and result. */
+function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void {
+  ctx.turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
+  ctx.turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
+  ctx.session.messages.push({
+    role: 'tool',
+    tool_call_id: tc.id,
+    content: JSON.stringify({ error: errorMsg })
+  });
+}
+
 /**
  * Runs one answer's tool calls in order through MCP, each result appended as a tool message. Circuit breaker: when a
  * result makes 2 identical tool errors in a row, the rest do not run and get a synthetic error result instead (every
- * tool call must have a result), and `tripped` is true.
+ * tool call must have a result), and `tripped` is true. In a wrap-up, `allowed` names the tools it offers: a call to any
+ * other does not run. `executed` counts the calls MCP ran; `posted` says one of them posted a Buzz message.
  */
 async function executeToolCalls(
   ctx: TurnContext,
   toolCalls: ToolCall[],
-  breaker: ToolErrorBreaker
-): Promise<{ tripped: boolean }> {
+  breaker: ToolErrorBreaker,
+  allowed: ReadonlySet<string> | null = null
+): Promise<{ tripped: boolean; executed: number; posted: boolean }> {
   const { session, sessionId, turnHandle } = ctx;
   let tripped = false;
+  let executed = 0;
+  let posted = false;
   const executedToolCallIds = new Set<string>();
 
   for (const tc of toolCalls) {
+    if (allowed && !allowed.has(tc.function.name)) {
+      console.warn(`[WRAP-UP] Not running ${tc.function.name}: the wrap-up does not offer it.`);
+      const errorMsg = refusedToolError(tc.function.name);
+      recordUnrunCall(ctx, tc, errorMsg);
+      executedToolCallIds.add(tc.id);
+      if (breaker.record(tc.function.name, errorMsg)) {
+        reportBreakerTrip(ctx, tc.function.name, breaker);
+        tripped = true;
+        break;
+      }
+      continue;
+    }
+
     let parsedArgs: Record<string, unknown> = {};
     try {
       parsedArgs = tc.function.arguments ? (JSON.parse(tc.function.arguments) as Record<string, unknown>) : {};
@@ -629,13 +680,7 @@ async function executeToolCalls(
       const msg = parseErr instanceof Error ? parseErr.message : String(parseErr);
       console.warn(`JSON parse error on tool arguments for ${tc.function.name}: ${msg}`);
       const errorMsg = `Tool execution truncated due to token limits: malformed JSON arguments (${msg})`;
-      turnHandle?.startToolSpan(tc.id, tc.function.name, tc.function.arguments);
-      turnHandle?.endToolSpan(tc.id, JSON.stringify({ error: errorMsg }), true, tc.function.name);
-      session.messages.push({
-        role: 'tool',
-        tool_call_id: tc.id,
-        content: JSON.stringify({ error: errorMsg })
-      });
+      recordUnrunCall(ctx, tc, errorMsg);
       executedToolCallIds.add(tc.id);
 
       if (breaker.record(tc.function.name, errorMsg)) {
@@ -651,6 +696,7 @@ async function executeToolCalls(
     turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
     const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
     console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
+    executed++;
 
     session.messages.push({
       role: 'tool',
@@ -671,6 +717,9 @@ async function executeToolCalls(
     }
 
     turnHandle?.endToolSpan(tc.id, toolResult, Boolean(errorString), tc.function.name);
+    if (!errorString && extractPostedEventId(toolResult)) {
+      posted = true;
+    }
 
     if (breaker.record(tc.function.name, errorString)) {
       reportBreakerTrip(ctx, tc.function.name, breaker);
@@ -695,7 +744,106 @@ async function executeToolCalls(
     }
     console.warn(`Circuit breaker triggered for session ${sessionId}. Ending turn.`);
   }
-  return { tripped };
+  return { tripped, executed, posted };
+}
+
+/**
+ * The wrap-up of a turn the adapter stopped (src/turn-stop.ts): up to ACP_WRAPUP_ITERATIONS more model calls after a
+ * notice that says why, so the model tells the person who asked. It offers every tool but those that tripped the
+ * breaker; it ends at the budget, on an answer without tool calls, on a posted message or when its own breaker trips.
+ * A failed call ends it and leaves the turn as the stop ended it; a cancel goes to the turn's own cancel path.
+ */
+async function runWrapup(
+  ctx: TurnContext,
+  stop: TurnStop,
+  tools: OpenAIFunctionTool[],
+  iteration: number
+): Promise<{ iterations: number; toolCalls: number }> {
+  const budget = WRAPUP.iterations;
+  if (budget === 0) {
+    return { iterations: 0, toolCalls: 0 };
+  }
+  const { session, sessionId } = ctx;
+  const offered = wrapupTools(tools, stop);
+  const allowed = new Set(offered.map((tool) => tool.function.name));
+  const notice: ChatMessage = { role: 'user', content: wrapupNotice(stop) };
+  session.messages.push(notice);
+  console.info(
+    `[WRAP-UP] Session ${sessionId}: ${describeTurnStop(stop)}; giving the model up to ${budget.toString()} call(s) ` +
+      `to tell the person (tools offered: ${offered.length.toString()} of ${tools.length.toString()}).`
+  );
+
+  const breaker = new ToolErrorBreaker();
+  let calls = 0;
+  let toolCalls = 0;
+  let posted = false;
+  try {
+    while (calls < budget) {
+      throwIfCancelled(session);
+      calls++;
+      console.info(`Wrap-up call ${calls.toString()}/${budget.toString()} for session ${sessionId}`);
+      const answer = await callModel(ctx, offered, iteration + calls);
+
+      if (answer.accumulator.isTruncated() && answer.accumulator.toolCalls.length > 0) {
+        recordTruncatedToolCalls(ctx, answer);
+        continue;
+      }
+      const validToolCalls: ToolCall[] = answer.accumulator.getValidToolCalls();
+      if (validToolCalls.length === 0) {
+        recordFinalAnswer(ctx, answer);
+        break;
+      }
+      recordToolCallAnswer(ctx, answer, validToolCalls);
+      const run = await executeToolCalls(ctx, validToolCalls, breaker, allowed);
+      toolCalls += run.executed;
+      if (run.posted) {
+        // The person has been told: another call could only post twice.
+        posted = true;
+        break;
+      }
+      if (run.tripped) {
+        break;
+      }
+    }
+  } catch (err: unknown) {
+    if (wasCancelled(session)) {
+      throw err;
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[WRAP-UP] Session ${sessionId}: the wrap-up failed (${msg}); ending the turn without it.`);
+    // A notice nothing answered would stay a user message that the next prompt follows: take it out.
+    const at = session.messages.indexOf(notice);
+    if (at !== -1 && !session.messages.slice(at + 1).some((message) => message.role === 'assistant')) {
+      session.messages.splice(at, 1);
+    }
+  }
+  console.info(
+    `[WRAP-UP] Session ${sessionId}: ended after ${calls.toString()} call(s), ${toolCalls.toString()} tool call(s)` +
+      `${posted ? ', posted' : ''}.`
+  );
+  return { iterations: calls, toolCalls };
+}
+
+/** Ends a turn the adapter stopped: committed, answered with an ACP stop reason. */
+function endStoppedTurn(ctx: TurnContext, stop: TurnStop): void {
+  const { id, session, sessionId, turnHandle } = ctx;
+  session.commit();
+  const content = stopMessageOf(stop);
+  turnHandle?.end('OK', content);
+  void telemetryService?.backgroundFlush();
+
+  // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
+  // protocol error that kills and respawns this process. An exhausted iteration budget is `max_turn_requests`;
+  // a circuit-breaker stop is a normal, committed end of turn.
+  sendResponse(id, {
+    sessionId,
+    message: {
+      role: 'assistant',
+      content
+    },
+    stopReason: stopReasonOf(stop)
+  });
+  sendNotification('session/turnComplete', { sessionId });
 }
 
 /**
@@ -739,9 +887,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
   const maxIterations = ITERATION_LIMIT.limit;
   let iteration = 0;
-  let turnCompleted = false;
-  // Why the loop ended when the model did not finish by itself: the while condition (iteration limit) unless the breaker fires.
-  let stoppedBy: 'iteration_limit' | 'circuit_breaker' = 'iteration_limit';
+  // Set when the breaker stops the loop; a loop that ends otherwise has used every iteration.
+  let stop: TurnStop | null = null;
 
   try {
     const tools = await mcpClient.getTools();
@@ -767,7 +914,6 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       if (validToolCalls.length === 0) {
         recordFinalAnswer(ctx, answer);
         session.commit();
-        turnCompleted = true;
 
         const content = answer.accumulator.content || '';
         turnHandle?.end('OK', content);
@@ -789,48 +935,28 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       recordToolCallAnswer(ctx, answer, validToolCalls);
       const { tripped } = await executeToolCalls(ctx, validToolCalls, breaker);
       if (tripped) {
-        stoppedBy = 'circuit_breaker';
+        stop = breakerStop(breaker);
         break;
       }
     }
 
-    if (!turnCompleted) {
-      session.commit();
-      const hitIterationLimit = stoppedBy === 'iteration_limit';
-      const finalContent = hitIterationLimit
-        ? `Turn stopped after ${maxIterations.toString()} model iterations (ACP_MAX_ITERATIONS). Send a new message to continue.`
-        : 'Turn execution stopped because repetitive tool errors occurred.';
-
-      if (hitIterationLimit) {
-        console.warn(
-          `[ITERATION LIMIT] Session ${sessionId} used all ${maxIterations.toString()} iterations of the turn. ` +
-            'Ending it with stopReason max_turn_requests.'
-        );
-        sendNotification('session/update', {
-          sessionId,
-          delta: {
-            type: 'text',
-            text: `\n\n*(Notice: iteration limit of ${maxIterations.toString()} reached; the turn was stopped.)*`
-          }
-        });
-      }
-
-      turnHandle?.end('OK', finalContent);
-      void telemetryService?.backgroundFlush();
-
-      // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
-      // protocol error that kills and respawns this process. An exhausted iteration budget is `max_turn_requests`;
-      // a circuit-breaker stop is a normal, committed end of turn.
-      sendResponse(id, {
+    // The model did not finish the turn: the breaker stopped it, or it used every iteration of it.
+    const stopped: TurnStop = stop ?? { reason: 'iteration_limit', limit: maxIterations };
+    if (stopped.reason === 'iteration_limit') {
+      console.warn(
+        `[ITERATION LIMIT] Session ${sessionId} used all ${maxIterations.toString()} iterations of the turn. ` +
+          'Ending it with stopReason max_turn_requests.'
+      );
+      sendNotification('session/update', {
         sessionId,
-        message: {
-          role: 'assistant',
-          content: finalContent
-        },
-        stopReason: hitIterationLimit ? 'max_turn_requests' : 'end_turn'
+        delta: {
+          type: 'text',
+          text: `\n\n*(Notice: iteration limit of ${maxIterations.toString()} reached; the turn was stopped.)*`
+        }
       });
-      sendNotification('session/turnComplete', { sessionId });
     }
+    await runWrapup(ctx, stopped, tools, iteration);
+    endStoppedTurn(ctx, stopped);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Turn execution error in session ${sessionId}: ${msg}`);
