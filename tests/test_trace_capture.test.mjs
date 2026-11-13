@@ -554,3 +554,25 @@ test('capture off keeps 0.3.0 value limit (8192); capture on keeps a whole 8207-
   const on = oneCall(ON, requestBody(chat(2)), { prompt }).span.attributes['input.value'];
   assert.equal(on, `${'p'.repeat(8192)}... [TRUNCATED]`);
 });
+
+// ---------------------------------------------------------------------------
+// A turn the adapter stopped (src/turn-stop.ts)
+// ---------------------------------------------------------------------------
+
+test('a wrap-up LLM span says so, a normal one has no wrap-up attribute, and the stopped turn is an error', () => {
+  const { service, spans } = tracing();
+  const turn = service.startTurnSpan('sess-1', 'Join the call', MODEL, {});
+  turn.startLlmSpan(MODEL, 1).end();
+  turn.startLlmSpan(MODEL, 2, { wrapup: true }).end();
+  turn.recordWrapup(1);
+  turn.end('ERROR', 'Turn execution stopped because repetitive tool errors occurred.', 'circuit_breaker', 'circuit breaker: 2 identical tool errors in a row from meeting_join');
+  const [normal, wrapup] = spans()
+    .filter((s) => s.name === `llm:${MODEL}`)
+    .sort((a, b) => a.attributes['llm.iteration'] - b.attributes['llm.iteration']);
+  assert.equal('deepseek.wrapup' in normal.attributes, false);
+  assert.equal(wrapup.attributes['deepseek.wrapup'], true);
+  const root = spans().find((s) => s.name === 'agent_turn');
+  assert.equal(root.attributes['deepseek.wrapup.iterations'], 1);
+  assert.equal(root.attributes['error.kind'], 'circuit_breaker');
+  assert.equal(root.status.code, 2);
+});

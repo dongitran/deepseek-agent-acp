@@ -30,6 +30,7 @@ import {
   registerSecret,
   parseNostrContext,
   type LlmSpanHandle,
+  type LlmSpanOptions,
   type TelemetryService,
   type TurnSpanHandle
 } from './telemetry.js';
@@ -439,9 +440,14 @@ function throwIfCancelled(session: Session): void {
  * One streamed chat-completions call on the session's messages. Text and reasoning deltas go out as session/update.
  * Throws when the key is missing, the API refuses the request, or the stream breaks or is cancelled.
  */
-async function callModel(ctx: TurnContext, tools: OpenAIFunctionTool[], iteration: number): Promise<ModelAnswer> {
+async function callModel(
+  ctx: TurnContext,
+  tools: OpenAIFunctionTool[],
+  iteration: number,
+  options?: LlmSpanOptions
+): Promise<ModelAnswer> {
   const { session, sessionId, turnHandle } = ctx;
-  const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration);
+  const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration, options);
 
   // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
   const messagesPayload = session.messages.map((m) => {
@@ -782,7 +788,7 @@ async function runWrapup(
       throwIfCancelled(session);
       calls++;
       console.info(`Wrap-up call ${calls.toString()}/${budget.toString()} for session ${sessionId}`);
-      const answer = await callModel(ctx, offered, iteration + calls);
+      const answer = await callModel(ctx, offered, iteration + calls, { wrapup: true });
 
       if (answer.accumulator.isTruncated() && answer.accumulator.toolCalls.length > 0) {
         recordTruncatedToolCalls(ctx, answer);
@@ -824,12 +830,16 @@ async function runWrapup(
   return { iterations: calls, toolCalls };
 }
 
-/** Ends a turn the adapter stopped: committed, answered with an ACP stop reason. */
-function endStoppedTurn(ctx: TurnContext, stop: TurnStop): void {
+/**
+ * Ends a turn the adapter stopped: committed, answered with an ACP stop reason, and traced as failed — the model did not
+ * finish it, whatever the wrap-up said (agent-infra #49: these turns showed as OK in Phoenix).
+ */
+function endStoppedTurn(ctx: TurnContext, stop: TurnStop, wrapup: { iterations: number }): void {
   const { id, session, sessionId, turnHandle } = ctx;
   session.commit();
   const content = stopMessageOf(stop);
-  turnHandle?.end('OK', content);
+  turnHandle?.recordWrapup(wrapup.iterations);
+  turnHandle?.end('ERROR', content, stop.reason, describeTurnStop(stop));
   void telemetryService?.backgroundFlush();
 
   // Only ACP stop reasons are valid here: buzz-acp answers any other value ("unknown stopReason") with a
@@ -955,8 +965,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
         }
       });
     }
-    await runWrapup(ctx, stopped, tools, iteration);
-    endStoppedTurn(ctx, stopped);
+    const wrapup = await runWrapup(ctx, stopped, tools, iteration);
+    endStoppedTurn(ctx, stopped, wrapup);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`Turn execution error in session ${sessionId}: ${msg}`);

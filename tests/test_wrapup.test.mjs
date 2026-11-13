@@ -123,3 +123,66 @@ test('a cancel during the wrap-up rolls the whole turn back', async () => {
   assert.ok(!next.messages.some((message) => message.role === 'tool'), 'no tool result of the cancelled turn is kept');
   assert.ok(!next.messages.some(isNotice));
 });
+
+// ---------------------------------------------------------------------------
+// Traces: a stopped turn is a failed turn (agent-infra #49: Phoenix showed these turns as OK)
+// ---------------------------------------------------------------------------
+
+const POSTED_ID = '40738780fa35899d341c45daeda99e609aff92c6d3cb44c54e06e7290e7bb38b';
+const SPAN_ERROR = 2;
+const SPAN_OK = 1;
+
+function spanNamed(spans, name) {
+  const found = spans.find((span) => span.name === name);
+  assert.ok(found, `no span ${name} among ${spans.map((span) => span.name).join(', ')}`);
+  return found;
+}
+
+const llmSpans = (spans) =>
+  spans.filter((span) => span.name === 'llm:deepseek-flash').sort((a, b) => a.attributes['llm.iteration'] - b.attributes['llm.iteration']);
+
+test("a breaker turn is an ERROR span with error.kind circuit_breaker, and the wrap-up's reply is linked", async () => {
+  const run = await runAdapter({
+    env: JOIN_FAILS,
+    trace: true,
+    reply: (res, n) => sse(res, n <= 2 ? join(n) : n === 3 ? reply(n) : text('Done.'))
+  });
+  const turn = spanNamed(run.spans, 'agent_turn');
+  assert.equal(turn.status.code, SPAN_ERROR);
+  assert.equal(turn.attributes['error.kind'], 'circuit_breaker');
+  assert.match(turn.attributes['error.message'], /2 identical tool errors in a row from meeting_join/);
+  assert.equal(turn.attributes['deepseek.wrapup.iterations'], 1);
+  assert.equal(turn.attributes['nostr.posted_event_id'], POSTED_ID, 'buzz-trace links the reply to this turn');
+  assert.deepEqual(
+    llmSpans(run.spans).map((span) => [span.attributes['llm.iteration'], span.attributes['deepseek.wrapup']]),
+    [[1, undefined], [2, undefined], [3, true]]
+  );
+});
+
+test('an iteration-limit turn is an ERROR span with error.kind iteration_limit', async () => {
+  const run = await runAdapter({
+    env: { ACP_MAX_ITERATIONS: '2' },
+    trace: true,
+    reply: (res, n) => sse(res, n <= 2 ? wait(n) : n === 3 ? reply(n) : text('Done.'))
+  });
+  const turn = spanNamed(run.spans, 'agent_turn');
+  assert.equal(turn.status.code, SPAN_ERROR);
+  assert.equal(turn.attributes['error.kind'], 'iteration_limit');
+  assert.match(turn.attributes['error.message'], /iteration limit/);
+  assert.equal(turn.attributes['deepseek.wrapup.iterations'], 1);
+});
+
+test('a turn the model finishes stays OK, with no wrap-up attribute anywhere', async () => {
+  const run = await runAdapter({
+    env: JOIN_FAILS,
+    trace: true,
+    reply: (res, n) => sse(res, n === 1 ? wait(n) : text('Chào bạn!'))
+  });
+  const turn = spanNamed(run.spans, 'agent_turn');
+  assert.equal(turn.status.code, SPAN_OK);
+  for (const span of run.spans) {
+    for (const key of Object.keys(span.attributes)) {
+      assert.doesNotMatch(key, /wrapup|^error\./, `${span.name} ${key}`);
+    }
+  }
+});
