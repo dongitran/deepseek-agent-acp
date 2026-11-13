@@ -12,18 +12,47 @@
 /** Identical tool errors in a row that stop a turn. */
 export const BREAKER_THRESHOLD = 2;
 
+/** A tool call that failed: its tool and its arguments in canonical form (canonicalArgs). */
+export interface FailedCall {
+  readonly name: string;
+  readonly args: string;
+}
+
+/**
+ * Tool-call arguments in one comparable form: JSON with its keys sorted (array order kept), `{}` for none, and any text
+ * that is not JSON as it is, trimmed. The same call written with other spacing or key order is the same call.
+ */
+export function canonicalArgs(raw: string): string {
+  const text = raw.trim();
+  if (text === '') {
+    return '{}';
+  }
+  try {
+    return JSON.stringify(JSON.parse(text), (_key, value: unknown) =>
+      value && typeof value === 'object' && !Array.isArray(value)
+        ? Object.fromEntries(Object.entries(value).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
+        : value
+    );
+  } catch {
+    return text;
+  }
+}
+
 /** Counts identical tool errors in a row: a success resets the count, a different error starts a new streak. */
 export class ToolErrorBreaker {
   private error: string | null = null;
   private count = 0;
-  private tools: string[] = [];
+  private calls: FailedCall[] = [];
 
-  /** Records one tool result (`error` null or empty for a success); true when it makes BREAKER_THRESHOLD in a row. */
-  record(toolName: string, error: string | null): boolean {
+  /**
+   * Records one tool result (`error` null or empty for a success) of the call `toolName` with its raw `args`; true when
+   * it makes BREAKER_THRESHOLD identical errors in a row.
+   */
+  record(toolName: string, args: string, error: string | null): boolean {
     if (!error) {
       this.error = null;
       this.count = 0;
-      this.tools = [];
+      this.calls = [];
       return false;
     }
     if (error === this.error) {
@@ -31,10 +60,11 @@ export class ToolErrorBreaker {
     } else {
       this.error = error;
       this.count = 1;
-      this.tools = [];
+      this.calls = [];
     }
-    if (!this.tools.includes(toolName)) {
-      this.tools.push(toolName);
+    const call = { name: toolName, args: canonicalArgs(args) };
+    if (!this.calls.some((known) => known.name === call.name && known.args === call.args)) {
+      this.calls.push(call);
     }
     return this.count >= BREAKER_THRESHOLD;
   }
@@ -44,20 +74,35 @@ export class ToolErrorBreaker {
     return this.error;
   }
 
-  /** The tools whose calls make up the current streak, each once, in the order they failed. */
+  /** The calls that make up the current streak, each once, in the order they failed. */
+  get streakCalls(): readonly FailedCall[] {
+    return this.calls;
+  }
+
+  /** The tools of those calls, each once. */
   get streakTools(): readonly string[] {
-    return this.tools;
+    return [...new Set(this.calls.map((call) => call.name))];
   }
 }
 
 /** Why the adapter stopped a turn the model had not finished. */
 export type TurnStop =
-  | { readonly reason: 'circuit_breaker'; readonly tools: readonly string[]; readonly error: string }
+  | {
+      readonly reason: 'circuit_breaker';
+      readonly tools: readonly string[];
+      readonly calls: readonly FailedCall[];
+      readonly error: string;
+    }
   | { readonly reason: 'iteration_limit'; readonly limit: number };
 
-/** The stop a tripped breaker makes: the tools of its streak and their common error. */
+/** The stop a tripped breaker makes: the calls of its streak, their tools and their common error. */
 export function breakerStop(breaker: ToolErrorBreaker): TurnStop {
-  return { reason: 'circuit_breaker', tools: [...breaker.streakTools], error: breaker.lastError ?? '' };
+  return {
+    reason: 'circuit_breaker',
+    tools: [...breaker.streakTools],
+    calls: [...breaker.streakCalls],
+    error: breaker.lastError ?? ''
+  };
 }
 
 /** One line for the log and the turn span's error.message. */
@@ -85,6 +130,19 @@ export function stopMessageOf(stop: TurnStop): string {
 // The wrap-up
 // ============================================================================
 
+/**
+ * A wrap-up call that does not run: a repeat — the same tool, the same arguments — of a call in the breaker's streak.
+ * Every tool stays offered: the one that failed may be how the agent answers (a shell agent posts with its shell, and
+ * the adapter's own tool timeout fails any command the same way), so only the call that failed is barred.
+ */
+export function isRepeatOfFailedCall(stop: TurnStop, name: string, args: string): boolean {
+  if (stop.reason !== 'circuit_breaker') {
+    return false;
+  }
+  const key = canonicalArgs(args);
+  return stop.calls.some((call) => call.name === name && call.args === key);
+}
+
 /** Opens the notice: the model must read it as the adapter speaking, not as the person. */
 export const WRAPUP_NOTICE_HEADER = '[deepseek-agent-acp: this turn is being stopped]';
 
@@ -102,13 +160,11 @@ function quoted(names: readonly string[]): string {
 
 function breakerSentence(tools: readonly string[]): string {
   const safe = tools.filter((name) => SAFE_TOOL_NAME.test(name));
-  if (safe.length === 0) {
-    return 'One of your tools returned the same error twice in a row (see its last result). The turn is being stopped, so do not try that action again.';
-  }
-  if (safe.length === 1) {
-    return `Your tool ${quoted(safe)} returned the same error twice in a row (see its last result). The turn is being stopped and that tool is no longer available in it, so do not try that action again.`;
-  }
-  return `Your tools ${quoted(safe)} returned the same error twice in a row (see their last results). The turn is being stopped and those tools are no longer available in it, so do not try that action again.`;
+  const which = safe.length > 0 ? `Your ${quoted(safe)} calls` : 'Two of your tool calls';
+  return (
+    `${which} returned the same error twice in a row (see their last results). The turn is being stopped, so do not ` +
+    'repeat them: the same calls will not run again.'
+  );
 }
 
 /**
@@ -135,20 +191,7 @@ export function wrapupNotice(stop: TurnStop): string {
   ].join('\n');
 }
 
-/**
- * The tools the wrap-up offers: after the breaker, every tool but those of its streak, so the model cannot loop on
- * them again; after the iteration limit, all of them. Never tool_choice: DeepSeek refuses `required` and named choices
- * in thinking mode (HTTP 400), which is the API default when no thinking setting is sent.
- */
-export function wrapupTools<T extends { function: { name: string } }>(tools: readonly T[], stop: TurnStop): T[] {
-  if (stop.reason !== 'circuit_breaker') {
-    return [...tools];
-  }
-  const excluded = stop.tools;
-  return tools.filter((tool) => !excluded.includes(tool.function.name));
-}
-
-/** The result of a call the wrap-up did not run: a tool it does not offer, such as the one that tripped the breaker. */
+/** The result of a wrap-up call that did not run because it repeats a call of the breaker's streak. */
 export function refusedToolError(name: string): string {
-  return `Tool ${name.slice(0, 64)} was not run: it is not available while this turn is being stopped.`;
+  return `Tool ${name.slice(0, 64)} was not run: the same call already failed twice in a row, and the turn is being stopped.`;
 }

@@ -40,11 +40,11 @@ import {
   ToolErrorBreaker,
   breakerStop,
   describeTurnStop,
+  isRepeatOfFailedCall,
   refusedToolError,
   stopMessageOf,
   stopReasonOf,
   wrapupNotice,
-  wrapupTools,
   type TurnStop
 } from './turn-stop.js';
 import type {
@@ -673,14 +673,14 @@ function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void
 /**
  * Runs one answer's tool calls in order through MCP, each result appended as a tool message. Circuit breaker: when a
  * result makes 2 identical tool errors in a row, the rest do not run and get a synthetic error result instead (every
- * tool call must have a result), and `tripped` is true. In a wrap-up, `allowed` names the tools it offers: a call to any
- * other does not run. `executed` counts the calls MCP ran; `posted` says one of them posted a Buzz message.
+ * tool call must have a result), and `tripped` is true. In a wrap-up, a call `refuse` matches (a repeat of a call that
+ * tripped the breaker) does not run. `executed` counts the calls MCP ran; `posted` says one of them posted a Buzz message.
  */
 async function executeToolCalls(
   ctx: TurnContext,
   toolCalls: ToolCall[],
   breaker: ToolErrorBreaker,
-  allowed: ReadonlySet<string> | null = null
+  refuse: ((tc: ToolCall) => boolean) | null = null
 ): Promise<{ tripped: boolean; executed: number; posted: boolean }> {
   const { session, sessionId, turnHandle } = ctx;
   let tripped = false;
@@ -689,12 +689,12 @@ async function executeToolCalls(
   const executedToolCallIds = new Set<string>();
 
   for (const tc of toolCalls) {
-    if (allowed && !allowed.has(tc.function.name)) {
-      console.warn(`[WRAP-UP] Not running ${tc.function.name}: the wrap-up does not offer it.`);
+    if (refuse?.(tc)) {
+      console.warn(`[WRAP-UP] Not running ${tc.function.name}: the same call already failed twice in a row.`);
       const errorMsg = refusedToolError(tc.function.name);
       recordUnrunCall(ctx, tc, errorMsg);
       executedToolCallIds.add(tc.id);
-      if (breaker.record(tc.function.name, errorMsg)) {
+      if (breaker.record(tc.function.name, tc.function.arguments, errorMsg)) {
         reportBreakerTrip(ctx, tc.function.name, breaker);
         tripped = true;
         break;
@@ -712,7 +712,7 @@ async function executeToolCalls(
       recordUnrunCall(ctx, tc, errorMsg);
       executedToolCallIds.add(tc.id);
 
-      if (breaker.record(tc.function.name, errorMsg)) {
+      if (breaker.record(tc.function.name, tc.function.arguments, errorMsg)) {
         reportBreakerTrip(ctx, tc.function.name, breaker);
         tripped = true;
         break;
@@ -752,7 +752,7 @@ async function executeToolCalls(
       posted = true;
     }
 
-    if (breaker.record(tc.function.name, errorString)) {
+    if (breaker.record(tc.function.name, tc.function.arguments, errorString)) {
       reportBreakerTrip(ctx, tc.function.name, breaker);
       tripped = true;
       break;
@@ -780,9 +780,9 @@ async function executeToolCalls(
 
 /**
  * The wrap-up of a turn the adapter stopped (src/turn-stop.ts): up to ACP_WRAPUP_ITERATIONS more model calls after a
- * notice that says why, so the model tells the person who asked. It offers every tool but those that tripped the
- * breaker; it ends at the budget, on an answer without tool calls, on a posted message or when its own breaker trips.
- * A failed call ends it and leaves the turn as the stop ended it; a cancel goes to the turn's own cancel path.
+ * notice that says why, so the model tells the person who asked. Every tool stays offered, but a repeat of a call that
+ * tripped the breaker does not run; it ends at the budget, on an answer without tool calls, on a posted message or when
+ * its own breaker trips. A failed call ends it and keeps what already ran; a cancel goes to the turn's cancel path.
  */
 async function runWrapup(
   ctx: TurnContext,
@@ -795,13 +795,12 @@ async function runWrapup(
     return { iterations: 0, toolCalls: 0 };
   }
   const { session, sessionId } = ctx;
-  const offered = wrapupTools(tools, stop);
-  const allowed = new Set(offered.map((tool) => tool.function.name));
+  const refuse = (tc: ToolCall): boolean => isRepeatOfFailedCall(stop, tc.function.name, tc.function.arguments);
   const notice: ChatMessage = { role: 'user', content: wrapupNotice(stop) };
   session.messages.push(notice);
   console.info(
     `[WRAP-UP] Session ${sessionId}: ${describeTurnStop(stop)}; giving the model up to ${budget.toString()} call(s) ` +
-      `to tell the person (tools offered: ${offered.length.toString()} of ${tools.length.toString()}).`
+      'to tell the person.'
   );
 
   const breaker = new ToolErrorBreaker();
@@ -813,7 +812,7 @@ async function runWrapup(
       throwIfCancelled(session);
       calls++;
       console.info(`Wrap-up call ${calls.toString()}/${budget.toString()} for session ${sessionId}`);
-      const answer = await callModel(ctx, offered, iteration + calls, { wrapup: true });
+      const answer = await callModel(ctx, tools, iteration + calls, { wrapup: true });
 
       if (answer.accumulator.isTruncated() && answer.accumulator.toolCalls.length > 0) {
         recordTruncatedToolCalls(ctx, answer);
@@ -825,7 +824,7 @@ async function runWrapup(
         break;
       }
       recordToolCallAnswer(ctx, answer, validToolCalls);
-      const run = await executeToolCalls(ctx, validToolCalls, breaker, allowed);
+      const run = await executeToolCalls(ctx, validToolCalls, breaker, refuse);
       toolCalls += run.executed;
       if (run.posted) {
         // The person has been told: another call could only post twice.
@@ -861,6 +860,9 @@ async function runWrapup(
  */
 function endStoppedTurn(ctx: TurnContext, stop: TurnStop, wrapup: { iterations: number }): void {
   const { id, session, sessionId, turnHandle } = ctx;
+  // A cancel that came while the last tool call ran (the turn's or the wrap-up's) must roll the turn back, not commit
+  // the result that call pushed onto the restored history: the turn's catch does that.
+  throwIfCancelled(session);
   session.commit();
   const content = stopMessageOf(stop);
   turnHandle?.recordWrapup(wrapup.iterations);

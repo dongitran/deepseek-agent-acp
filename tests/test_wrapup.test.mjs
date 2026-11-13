@@ -20,7 +20,7 @@ const reply = (n) => toolCalls([{ id: `call_${n}`, name: 'reply', args: REPLY_AR
 const toolNames = (request) => (request.tools ?? []).map((tool) => tool.function.name);
 const isNotice = (message) => message.role === 'user' && typeof message.content === 'string' && message.content.startsWith(HEADER);
 
-test('breaker on meeting_join: one more call without meeting_join, and its reply is posted', async () => {
+test('breaker on meeting_join: one more call, and its reply is posted', async () => {
   const run = await runAdapter({
     env: JOIN_FAILS,
     reply: (res, n) => sse(res, n <= 2 ? join(n) : n === 3 ? reply(n) : text('Done.'))
@@ -29,16 +29,16 @@ test('breaker on meeting_join: one more call without meeting_join, and its reply
   const wrapup = run.requests[2];
   const notice = wrapup.messages.at(-1);
   assert.ok(isNotice(notice), 'the wrap-up call ends with the adapter\'s notice');
-  assert.ok(notice.content.includes('Your tool `meeting_join`'));
-  assert.deepEqual(toolNames(wrapup), ['meeting_wait', 'thread_read', 'reply'], 'everything but the failed tool');
+  assert.ok(notice.content.includes('Your `meeting_join` calls'));
   assert.deepEqual(toolNames(run.requests[0]), ['meeting_wait', 'thread_read', 'reply', 'meeting_join']);
+  assert.deepEqual(toolNames(wrapup), toolNames(run.requests[0]), 'every tool stays offered');
   assert.deepEqual(run.calls, ['meeting_join', 'meeting_join', 'reply'], 'the reply really ran');
   const [response] = run.responses;
   assert.equal(response.result.stopReason, 'end_turn');
   assert.match(response.result.message.content, /repetitive tool errors/);
 });
 
-test('a call to the tool that tripped the breaker is refused unrun', async () => {
+test('a repeat of the call that tripped the breaker is refused unrun', async () => {
   const run = await runAdapter({
     env: JOIN_FAILS,
     reply: (res, n) => sse(res, n <= 3 ? join(n) : text('Sorry.'))
@@ -48,6 +48,21 @@ test('a call to the tool that tripped the breaker is refused unrun', async () =>
   const refused = run.requests[3].messages.find((message) => message.role === 'tool' && message.tool_call_id === 'call_3');
   assert.ok(refused, 'the refused call still has its tool result');
   assert.match(refused.content, /was not run/);
+});
+
+test('a different call to the tool that tripped the breaker still runs: an agent that answers through its shell', async () => {
+  // buzz-dev-mcp's shell fails only on infrastructure errors, such as the adapter's own timeout: identical for any command.
+  const shell = (n, command) => toolCalls([{ id: `call_${n}`, name: 'shell', args: JSON.stringify({ command }) }]);
+  const send = `buzz messages send --channel c --reply-to ${'a'.repeat(64)} --content -`;
+  const run = await runAdapter({
+    env: { MOCK_MCP_EXTRA_TOOLS: 'shell' },
+    reply: (res, n) =>
+      sse(res, n === 1 ? shell(n, 'sleep 100') : n === 2 ? shell(n, 'sleep 200') : n === 3 ? shell(n, send) : text('Done.'))
+  });
+  assert.equal(run.requests.length, 3, 'the message posted through the shell ends the wrap-up');
+  assert.ok(toolNames(run.requests[2]).includes('shell'), 'the shell stays offered: it is how this agent answers');
+  assert.deepEqual(run.calls, ['shell', 'shell', 'shell']);
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
 });
 
 test('the wrap-up never makes more than ACP_WRAPUP_ITERATIONS calls', async () => {
@@ -104,6 +119,25 @@ test('the wrap-up request failing leaves the turn as the breaker ended it', asyn
   const joinResults = next.messages.filter((message) => message.role === 'tool' && /No valid session ID/.test(message.content));
   assert.equal(joinResults.length, 2, 'the stopped turn was committed');
   assert.match(run.stderr, /\[WRAP-UP\] .*the wrap-up failed/);
+});
+
+test('a wrap-up call that fails after a call ran keeps what ran, and the notice that asked for it', async () => {
+  const run = await runAdapter({
+    env: JOIN_FAILS,
+    prompts: ['Join the call', 'Are you there?'],
+    reply: (res, n) => {
+      if (n === 4) {
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('bad request');
+        return;
+      }
+      sse(res, n <= 2 ? join(n) : n === 3 ? toolCalls([{ id: 'call_3', name: 'thread_read', args: '{}' }]) : text('Yes.'));
+    }
+  });
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
+  const next = run.requests[4];
+  assert.ok(next.messages.some(isNotice), 'the notice stays: an answer follows it');
+  assert.ok(next.messages.some((message) => message.role === 'tool' && message.tool_call_id === 'call_3'));
 });
 
 test('a cancel during the wrap-up rolls the whole turn back', async () => {
@@ -258,4 +292,26 @@ test('a failing, a malformed and a refused call each end failed; a call never at
   const failed = ['tool_call:in_progress', 'tool_call_update:failed'];
   assert.deepEqual(statuses, { call_1: failed, call_2: failed, call_3: failed, call_3b: failed });
   assert.deepEqual(run.calls, ['meeting_join', 'meeting_join'], 'only the two joins ran');
+});
+
+test('a cancel while a wrap-up tool call runs rolls the whole turn back', async () => {
+  const run = await runAdapter({
+    env: { ...JOIN_FAILS, MOCK_MCP_SLOW_TOOLS: 'reply:1500' },
+    trace: true,
+    prompts: ['Join the call', 'Hello again'],
+    reply: (res, n) => sse(res, n <= 2 ? join(n) : n === 3 ? reply(n) : text('Hi.')),
+    onPrompt: async (index, { send, stdout }) => {
+      if (index === 0) {
+        await waitFor(() => stdout().includes('"toolCallId":"call_3"'), 10000, 'the wrap-up reply to start');
+        send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: SESSION_ID } });
+      }
+    }
+  });
+  assert.equal(run.responses[0].result.stopReason, 'error', 'the cancel path answers as it always has');
+  const next = run.requests[3];
+  assert.ok(!next.messages.some((message) => message.role === 'tool'), 'the reply that finished after the cancel is not kept');
+  assert.ok(!next.messages.some(isNotice));
+  const turns = run.spans.filter((span) => span.name === 'agent_turn');
+  assert.ok(turns.some((span) => span.attributes['deepseek.stop_reason'] === 'cancelled'), 'the turn is traced as cancelled');
+  assert.ok(!turns.some((span) => span.attributes['error.kind'] === 'circuit_breaker'));
 });
