@@ -112,3 +112,20 @@ test('McpClient: a call whose turn is already cancelled never reaches the server
     await client.close();
   }
 });
+
+test('McpClient: a turn cancelled while the client connects runs no tool', async () => {
+  // The first call connects the client (as after a lost connection); the cancel lands during that connect.
+  const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-cancel-')), 'calls.log');
+  process.env.MOCK_MCP_CALL_LOG = log;
+  const turn = new AbortController();
+  const client = new McpClient(MOCK_MCP);
+  try {
+    const call = client.callTool('reply', { text: 'late' }, turn.signal);
+    turn.abort();
+    assert.match(await call, /cancelled/);
+    assert.equal(fs.existsSync(log), false, 'no tool ran');
+  } finally {
+    delete process.env.MOCK_MCP_CALL_LOG;
+    await client.close();
+  }
+});

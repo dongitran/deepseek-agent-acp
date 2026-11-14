@@ -188,6 +188,11 @@ export class McpClient {
     if (!this.isConnected || !this.client) {
       return JSON.stringify({ error: `MCP tool ${name} unavailable: MCP client is not connected.` });
     }
+    // The turn may have been cancelled while the client connected: its abort event has fired already, so the listener
+    // below would never hear it. Nothing awaits between this check and that listener.
+    if (signal?.aborted) {
+      return JSON.stringify({ error: `Tool execution cancelled: ${name} was not run.` });
+    }
 
     const timeoutMs = parseInt(process.env.MCP_TOOL_TIMEOUT_MS ?? '60000', 10);
     let timerId: NodeJS.Timeout | null = null;
