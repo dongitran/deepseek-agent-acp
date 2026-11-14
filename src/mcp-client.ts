@@ -70,7 +70,11 @@ function requestController(signal?: AbortSignal): { signal: AbortSignal; release
   const forward = (): void => {
     controller.abort(signal?.reason);
   };
-  signal?.addEventListener('abort', forward, { once: true });
+  if (signal?.aborted) {
+    controller.abort(signal.reason);
+  } else {
+    signal?.addEventListener('abort', forward, { once: true });
+  }
   return { signal: controller.signal, release: () => signal?.removeEventListener('abort', forward) };
 }
 
@@ -84,6 +88,8 @@ async function abortedFirst(work: Promise<unknown>, signal?: AbortSignal): Promi
     return false;
   }
   if (signal.aborted) {
+    // Left to finish alone: observe its failure so it never becomes an unhandled rejection.
+    work.catch(() => undefined);
     return true;
   }
   let onAbort: (() => void) | undefined;

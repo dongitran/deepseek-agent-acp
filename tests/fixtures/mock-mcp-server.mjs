@@ -6,7 +6,7 @@
  *   meeting_join — always fails, as the meeting gate did on 2026-11-13 (agent-infra #49);
  *   shell        — like buzz-dev-mcp's shell for a shell agent: `buzz messages send …` posts, anything else times out.
  * MOCK_MCP_SLOW_TOOLS=<name>:<ms>,… holds those calls that long before answering.
- * MOCK_MCP_SLOW_LIST=<ms> holds every tools/list that long.
+ * MOCK_MCP_SLOW_LIST=<ms> holds every tools/list that long; MOCK_MCP_LIST_LOG=<file> gets a line per tools/list on arrival.
  * MOCK_MCP_CALL_LOG=<file> appends the name of every tool called, one per line, so a test sees what really ran.
  */
 import { appendFileSync } from 'node:fs';
@@ -47,6 +47,9 @@ const CALL_LOG = process.env.MOCK_MCP_CALL_LOG;
 const server = new Server({ name: 'mock-meeting-mcp', version: '1.0.0' }, { capabilities: { tools: {} } });
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (process.env.MOCK_MCP_LIST_LOG) {
+    appendFileSync(process.env.MOCK_MCP_LIST_LOG, 'tools/list\n');
+  }
   const slowList = Number(process.env.MOCK_MCP_SLOW_LIST);
   if (slowList > 0) {
     await new Promise((resolve) => setTimeout(resolve, slowList));

@@ -66,7 +66,7 @@ test('a cancel while a tool call runs is answered at once, within the 5 s buzz-a
 test("after a cancel, the rest of the answer's tool calls never run", async () => {
   const timing = {};
   const run = await runAdapter({
-    env: { MOCK_MCP_SLOW_TOOLS: 'meeting_wait:1500' },
+    env: { MOCK_MCP_SLOW_TOOLS: 'meeting_wait:8000' },
     reply: (res, n) =>
       sse(
         res,
@@ -81,6 +81,7 @@ test("after a cancel, the rest of the answer's tool calls never run", async () =
   });
   assert.equal(run.responses[0].result.stopReason, 'cancelled');
   assert.deepEqual(run.calls, ['meeting_wait'], 'nothing is posted after the person stopped the turn');
+  assert.ok(!run.messages.some((m) => m.params?.update?.toolCallId === 'call_r'), 'the skipped call is not reported');
 });
 
 test('McpClient: a long-lived turn signal keeps no abort listener once its calls end, however many they are', async () => {
@@ -132,12 +133,15 @@ test('McpClient: a turn cancelled while the client connects runs no tool', async
 });
 
 test('a cancel while the turn lists its tools is answered at once', async () => {
-  // Each turn starts by listing the MCP tools; a slow server (7 s here) must not hold the cancelled turn's answer.
+  // Each turn starts by listing the MCP tools; a slow server (7 s here) must not hold the cancelled turn's answer. The
+  // cancel waits until the server has the list request, so it lands in the listing, not in the start-up connect.
+  const listLog = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-cancel-')), 'lists.log');
+  const listed = () => fs.existsSync(listLog) && fs.readFileSync(listLog, 'utf8').includes('tools/list');
   const timing = {};
   const run = await runAdapter({
-    env: { MOCK_MCP_SLOW_LIST: '7000' },
+    env: { MOCK_MCP_SLOW_LIST: '7000', MOCK_MCP_LIST_LOG: listLog },
     reply: (res) => sse(res, text('Done.')),
-    onPrompt: cancelWhen(() => true, timing)
+    onPrompt: cancelWhen(listed, timing)
   });
   assert.equal(run.responses[0].result.stopReason, 'cancelled');
   assert.ok(timing.ms < 2000, `answered ${timing.ms} ms after the cancel; listing the tools takes 7000 ms`);
@@ -147,7 +151,7 @@ test('a cancel while the turn lists its tools is answered at once', async () => 
 test("a cancel during the last allowed iteration's tool call ends the turn as cancelled, not at the iteration limit", async () => {
   const timing = {};
   const run = await runAdapter({
-    env: { ACP_MAX_ITERATIONS: '1', MOCK_MCP_SLOW_TOOLS: 'meeting_wait:1500' },
+    env: { ACP_MAX_ITERATIONS: '1', MOCK_MCP_SLOW_TOOLS: 'meeting_wait:8000' },
     reply: (res, n) => sse(res, wait(n)),
     onPrompt: cancelWhen((out) => out.includes('"sessionUpdate":"tool_call"'), timing)
   });
