@@ -152,7 +152,7 @@ test('a cancel during the wrap-up rolls the whole turn back', async () => {
       }
     }
   });
-  assert.equal(run.responses[0].result.stopReason, 'error', 'the cancel path answers as it always has');
+  assert.equal(run.responses[0].result.stopReason, 'cancelled', 'ACP: a cancelled turn answers cancelled');
   const next = run.requests[3];
   assert.ok(!next.messages.some((message) => message.role === 'tool'), 'no tool result of the cancelled turn is kept');
   assert.ok(!next.messages.some(isNotice));
@@ -307,7 +307,7 @@ test('a cancel while a wrap-up tool call runs rolls the whole turn back', async 
       }
     }
   });
-  assert.equal(run.responses[0].result.stopReason, 'error', 'the cancel path answers as it always has');
+  assert.equal(run.responses[0].result.stopReason, 'cancelled', 'ACP: a cancelled turn answers cancelled');
   const next = run.requests[3];
   assert.ok(!next.messages.some((message) => message.role === 'tool'), 'the reply that finished after the cancel is not kept');
   assert.ok(!next.messages.some(isNotice));

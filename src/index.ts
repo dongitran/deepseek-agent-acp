@@ -689,6 +689,9 @@ async function executeToolCalls(
   const executedToolCallIds = new Set<string>();
 
   for (const tc of toolCalls) {
+    // A cancel stops the answer's remaining calls too (ACP: stop tool calls as soon as possible): nothing more runs,
+    // posts or speaks for a turn the person stopped.
+    throwIfCancelled(session);
     if (refuse?.(tc)) {
       console.warn(`[WRAP-UP] Not running ${tc.function.name}: the same call already failed twice in a row.`);
       const errorMsg = refusedToolError(tc.function.name);
@@ -724,7 +727,7 @@ async function executeToolCalls(
     console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
     sendToolCallStarted(sessionId, tc.id, tc.function.name);
     turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
-    const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
+    const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs, session.abortController?.signal);
     console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
     executed++;
 
@@ -996,20 +999,33 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
     endStoppedTurn(ctx, stopped, wrapup);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Turn execution error in session ${sessionId}: ${msg}`);
+    // Read before the rollback below, which clears the controller: session/cancel aborts and clears it, and nothing else
+    // does. The error is whatever the aborted step threw (AbortError, a stream or a tool cut short), never the reason.
+    const cancelled = wasCancelled(session);
 
     // Rollback session state on error
     session.rollback();
 
-    const isCancelled =
-      session.abortController?.signal?.aborted ||
-      (err instanceof Error && (err.name === 'AbortError' || err.message.includes('cancellation')));
-
-    if (isCancelled) {
+    if (cancelled) {
+      // ACP: the agent MUST answer a cancelled turn with `cancelled` and catch the errors its aborted operations throw.
+      // buzz-acp takes any other stop reason as a protocol error and respawns this process, losing every session in it.
+      console.info(`Turn in session ${sessionId} cancelled by the client (${msg}); rolled back to the last checkpoint.`);
       turnHandle?.end('CANCELLED');
-    } else {
-      turnHandle?.end('ERROR', undefined, 'turn_failed', msg);
+      void telemetryService?.backgroundFlush();
+      sendResponse(id, {
+        sessionId,
+        message: {
+          role: 'assistant',
+          content: ''
+        },
+        stopReason: 'cancelled'
+      });
+      sendNotification('session/turnComplete', { sessionId });
+      return;
     }
+
+    console.error(`Turn execution error in session ${sessionId}: ${msg}`);
+    turnHandle?.end('ERROR', undefined, 'turn_failed', msg);
     void telemetryService?.backgroundFlush();
 
     sendNotification('session/update', {

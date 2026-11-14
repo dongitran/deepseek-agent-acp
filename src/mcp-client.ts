@@ -173,9 +173,14 @@ export class McpClient {
   }
 
   /**
-   * Call a tool via MCP. Returns result string.
+   * Call a tool via MCP. Returns result string. `signal` (the turn's) cancels the call: the SDK tells the server
+   * (notifications/cancelled) and the call ends at once with an error instead of when the tool finishes — ACP asks an
+   * agent to stop its tool calls as soon as a turn is cancelled, and buzz-acp waits only 5 s for the cancelled turn.
    */
-  async callTool(name: string, args: Record<string, unknown> = {}): Promise<string> {
+  async callTool(name: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<string> {
+    if (signal?.aborted) {
+      return JSON.stringify({ error: `Tool execution cancelled: ${name} was not run.` });
+    }
     if (!this.isConnected || !this.client) {
       await this.init();
     }
@@ -186,12 +191,23 @@ export class McpClient {
 
     const timeoutMs = parseInt(process.env.MCP_TOOL_TIMEOUT_MS ?? '60000', 10);
     let timerId: NodeJS.Timeout | null = null;
+    // A controller of its own for each call: the SDK adds an abort listener to the signal it is given and never removes
+    // it, so the turn's signal, shared by every call of a turn (hundreds in a meeting), would collect them.
+    const callController = new AbortController();
+    const forwardAbort = (): void => {
+      callController.abort(signal?.reason);
+    };
+    signal?.addEventListener('abort', forwardAbort, { once: true });
 
     try {
-      const callPromise = this.client.callTool({
-        name,
-        arguments: args
-      });
+      const callPromise = this.client.callTool(
+        {
+          name,
+          arguments: args
+        },
+        undefined,
+        { signal: callController.signal }
+      );
 
       const timeoutPromise = new Promise<never>((_, reject) => {
         timerId = setTimeout(() => {
@@ -215,6 +231,9 @@ export class McpClient {
 
       return typeof response === 'string' ? response : JSON.stringify(response);
     } catch (err: unknown) {
+      if (callController.signal.aborted) {
+        return JSON.stringify({ error: `Tool execution cancelled: ${name} was stopped with its turn.` });
+      }
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[deepseek-acp:ERROR] MCP tool ${name} call failed: ${msg}\n`);
       return JSON.stringify({ error: `Tool execution error: ${msg}` });
@@ -222,6 +241,7 @@ export class McpClient {
       if (timerId !== null) {
         clearTimeout(timerId);
       }
+      signal?.removeEventListener('abort', forwardAbort);
     }
   }
 

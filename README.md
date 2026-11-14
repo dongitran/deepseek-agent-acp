@@ -151,6 +151,7 @@ environment at start-up (see In-Memory Secret Sanitization).
 | :--- | :--- |
 | `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
+| `cancelled` | The client sent `session/cancel`. The running model request and tool call are aborted at once (the MCP server is told), the answer's remaining tool calls never run, and the turn is rolled back; the answer comes within milliseconds, as ACP requires and as buzz-acp, which waits 5 s, needs. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
 
 ### When the adapter stops a turn
@@ -256,7 +257,7 @@ only where everyone who can open the Phoenix project may read those conversation
 * **`initialize`**: Exchanges protocol version (`1`), agent metadata, and capabilities (`streaming`, `tools`, `sessionCancellation`).
 * **`session/new`**: Initializes a fresh session instance with an isolated message history and system prompt.
 * **`session/prompt`**: Executes an autonomous multi-turn prompt, streaming reasoning and text deltas.
-* **`session/cancel`**: Aborts ongoing completions, restores state to the last checkpoint, and confirms cancellation.
+* **`session/cancel`** (a notification): Aborts the running model request and tool call, stops the answer's remaining tool calls, restores state to the last checkpoint, and answers the pending `session/prompt` with `stopReason: "cancelled"`.
 
 ### Notifications
 * **`session/update`**: Emits real-time stream deltas (`type: "thought"` for reasoning, `type: "text"` for content).
