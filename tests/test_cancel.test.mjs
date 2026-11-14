@@ -114,7 +114,8 @@ test('McpClient: a call whose turn is already cancelled never reaches the server
 });
 
 test('McpClient: a turn cancelled while the client connects runs no tool', async () => {
-  // The first call connects the client (as after a lost connection); the cancel lands during that connect.
+  // The first call connects the client (as when the start-up connect failed or has not finished); the cancel lands
+  // during that connect.
   const log = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'deepseek-cancel-')), 'calls.log');
   process.env.MOCK_MCP_CALL_LOG = log;
   const turn = new AbortController();
@@ -128,4 +129,45 @@ test('McpClient: a turn cancelled while the client connects runs no tool', async
     delete process.env.MOCK_MCP_CALL_LOG;
     await client.close();
   }
+});
+
+test('a cancel while the turn lists its tools is answered at once', async () => {
+  // Each turn starts by listing the MCP tools; a slow server (7 s here) must not hold the cancelled turn's answer.
+  const timing = {};
+  const run = await runAdapter({
+    env: { MOCK_MCP_SLOW_LIST: '7000' },
+    reply: (res) => sse(res, text('Done.')),
+    onPrompt: cancelWhen(() => true, timing)
+  });
+  assert.equal(run.responses[0].result.stopReason, 'cancelled');
+  assert.ok(timing.ms < 2000, `answered ${timing.ms} ms after the cancel; listing the tools takes 7000 ms`);
+  assert.equal(run.requests.length, 0, 'the model is never called');
+});
+
+test("a cancel during the last allowed iteration's tool call ends the turn as cancelled, not at the iteration limit", async () => {
+  const timing = {};
+  const run = await runAdapter({
+    env: { ACP_MAX_ITERATIONS: '1', MOCK_MCP_SLOW_TOOLS: 'meeting_wait:1500' },
+    reply: (res, n) => sse(res, wait(n)),
+    onPrompt: cancelWhen((out) => out.includes('"sessionUpdate":"tool_call"'), timing)
+  });
+  assert.equal(run.responses[0].result.stopReason, 'cancelled');
+  assert.ok(!run.messages.some((m) => JSON.stringify(m).includes('iteration limit')), 'no iteration-limit notice');
+  assert.doesNotMatch(run.stderr, /\[ITERATION LIMIT\]|\[WRAP-UP\]/);
+});
+
+test('a steer that arrives after the cancel is refused, so the client still delivers it', async () => {
+  const run = await runAdapter({
+    prompts: ['hello'],
+    reply: (res) => sseHanging(res, 'Partial'),
+    onPrompt: async (index, { send, stdout }) => {
+      await waitFor(() => stdout().includes('Partial'), 10000, 'the answer to start');
+      send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: SESSION_ID } });
+      send({ jsonrpc: '2.0', id: 50, method: '_session/steering', params: { sessionId: SESSION_ID, prompt: 'one more thing' } });
+    }
+  });
+  assert.equal(run.responses[0].result.stopReason, 'cancelled');
+  const steer = run.messages.find((m) => m.id === 50);
+  assert.ok(steer, 'the steer is answered');
+  assert.equal(steer.result.outcome, 'promptRequired', 'not `injected`: the rollback would drop it');
 });

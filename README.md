@@ -151,7 +151,7 @@ environment at start-up (see In-Memory Secret Sanitization).
 | :--- | :--- |
 | `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
-| `cancelled` | The client sent `session/cancel`. The running model request and tool call are aborted at once (the MCP server is told), the answer's remaining tool calls never run, and the turn is rolled back; the answer comes within milliseconds, as ACP requires and as buzz-acp, which waits 5 s, needs. |
+| `cancelled` | The client sent `session/cancel`. The model request, the tool list and the tool call in progress are cut short at once (the MCP server is told with `notifications/cancelled`; a server that ignores it may still finish that call), the answer's remaining tool calls never run, a steer that arrives after the cancel is answered `promptRequired`, and the turn is rolled back. ACP requires this stop reason; buzz-acp waits only 5 s for it, so the answer comes at once, not when a tool would end. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
 
 ### When the adapter stops a turn

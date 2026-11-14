@@ -61,6 +61,45 @@ export function sanitizeSubprocessEnv(sourceEnv: NodeJS.ProcessEnv = process.env
   return cleanEnv;
 }
 
+/**
+ * A controller for one MCP request that follows the turn's `signal`. The SDK adds an abort listener to the signal it is
+ * given and never removes it, so it gets this throwaway one; `release` detaches the forwarding from the turn's signal.
+ */
+function requestController(signal?: AbortSignal): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController();
+  const forward = (): void => {
+    controller.abort(signal?.reason);
+  };
+  signal?.addEventListener('abort', forward, { once: true });
+  return { signal: controller.signal, release: () => signal?.removeEventListener('abort', forward) };
+}
+
+/**
+ * Waits for `work` or for `signal` to abort, whichever comes first; true when the abort came first. `work` goes on
+ * either way: a connect is shared (init's own guard), and the next caller finds it done.
+ */
+async function abortedFirst(work: Promise<unknown>, signal?: AbortSignal): Promise<boolean> {
+  if (!signal) {
+    await work;
+    return false;
+  }
+  if (signal.aborted) {
+    return true;
+  }
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<boolean>((resolve) => {
+    onAbort = () => resolve(true);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([work.then(() => false), aborted]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 export class McpClient {
   public mcpCommand: string;
   public args: string[];
@@ -138,19 +177,23 @@ export class McpClient {
   }
 
   /**
-   * List available tools from MCP server converted to OpenAI function calling format.
+   * List available tools from MCP server converted to OpenAI function calling format. `signal` (the turn's) cuts the
+   * wait short, connect included: a cancelled turn gets the last known list at once.
    */
-  async getTools(): Promise<OpenAIFunctionTool[]> {
+  async getTools(signal?: AbortSignal): Promise<OpenAIFunctionTool[]> {
     if (!this.isConnected || !this.client) {
-      await this.init();
+      if (await abortedFirst(this.init(), signal)) {
+        return this.cachedTools;
+      }
     }
 
-    if (!this.isConnected || !this.client) {
+    if (!this.isConnected || !this.client || signal?.aborted) {
       return this.cachedTools;
     }
 
+    const request = requestController(signal);
     try {
-      const response = await this.client.listTools();
+      const response = await this.client.listTools(undefined, { signal: request.signal });
       const tools = response.tools || [];
       this.cachedTools = tools.map((t) => ({
         type: 'function' as const,
@@ -162,9 +205,14 @@ export class McpClient {
       }));
       return this.cachedTools;
     } catch (err: unknown) {
+      if (request.signal.aborted) {
+        return this.cachedTools;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[deepseek-acp:ERROR] Failed to list MCP tools: ${msg}\n`);
       return this.cachedTools;
+    } finally {
+      request.release();
     }
   }
 
@@ -182,7 +230,9 @@ export class McpClient {
       return JSON.stringify({ error: `Tool execution cancelled: ${name} was not run.` });
     }
     if (!this.isConnected || !this.client) {
-      await this.init();
+      if (await abortedFirst(this.init(), signal)) {
+        return JSON.stringify({ error: `Tool execution cancelled: ${name} was not run.` });
+      }
     }
 
     if (!this.isConnected || !this.client) {
@@ -196,13 +246,8 @@ export class McpClient {
 
     const timeoutMs = parseInt(process.env.MCP_TOOL_TIMEOUT_MS ?? '60000', 10);
     let timerId: NodeJS.Timeout | null = null;
-    // A controller of its own for each call: the SDK adds an abort listener to the signal it is given and never removes
-    // it, so the turn's signal, shared by every call of a turn (hundreds in a meeting), would collect them.
-    const callController = new AbortController();
-    const forwardAbort = (): void => {
-      callController.abort(signal?.reason);
-    };
-    signal?.addEventListener('abort', forwardAbort, { once: true });
+    // A controller of its own for each call: the turn's signal is shared by every call of a turn (hundreds in a meeting).
+    const request = requestController(signal);
 
     try {
       const callPromise = this.client.callTool(
@@ -211,7 +256,7 @@ export class McpClient {
           arguments: args
         },
         undefined,
-        { signal: callController.signal }
+        { signal: request.signal }
       );
 
       const timeoutPromise = new Promise<never>((_, reject) => {
@@ -236,7 +281,7 @@ export class McpClient {
 
       return typeof response === 'string' ? response : JSON.stringify(response);
     } catch (err: unknown) {
-      if (callController.signal.aborted) {
+      if (request.signal.aborted) {
         return JSON.stringify({ error: `Tool execution cancelled: ${name} was stopped with its turn.` });
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -246,7 +291,7 @@ export class McpClient {
       if (timerId !== null) {
         clearTimeout(timerId);
       }
-      signal?.removeEventListener('abort', forwardAbort);
+      request.release();
     }
   }
 
