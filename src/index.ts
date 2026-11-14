@@ -410,12 +410,17 @@ export function extractPromptText(params?: Record<string, unknown>): string {
 // without a tool call, the circuit breaker trips, or the iteration limit is reached.
 // ============================================================================
 
-/** What the steps of one turn share: the request being answered, its session and its trace. */
+/** What the steps of one turn share: the request being answered, its session, its trace and its cancel signal. */
 interface TurnContext {
   id: string | number | undefined;
   sessionId: string;
   session: Session;
   turnHandle: TurnSpanHandle | undefined;
+  /**
+   * The turn's own cancel signal, kept here once: session/cancel aborts it and then clears `session.abortController`,
+   * so a step that read the controller later would find no signal at all and run on uncancelled.
+   */
+  signal: AbortSignal;
 }
 
 /** One model call's answer: what streamed in, the assistant message built from it, and its LLM span, still open. */
@@ -475,9 +480,7 @@ async function callModel(
   // Call DeepSeek Chat Completions with Streaming (request timeout: DEEPSEEK_REQUEST_TIMEOUT_MS, default 90s)
   const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
   const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
-  const combinedSignal = session.abortController
-    ? AbortSignal.any([session.abortController.signal, timeoutSignal])
-    : timeoutSignal;
+  const combinedSignal = AbortSignal.any([ctx.signal, timeoutSignal]);
 
   const requestBody = {
     model: MODEL,
@@ -513,7 +516,7 @@ async function callModel(
 
   try {
     for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
-      if (session.abortController?.signal?.aborted || !session.abortController) {
+      if (wasCancelled(session)) {
         recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
         llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
         throw new Error('Stream aborted by client cancellation.');
@@ -689,6 +692,9 @@ async function executeToolCalls(
   const executedToolCallIds = new Set<string>();
 
   for (const tc of toolCalls) {
+    // A cancel stops the answer's remaining calls too (ACP: stop tool calls as soon as possible): nothing more runs,
+    // posts or speaks for a turn the person stopped.
+    throwIfCancelled(session);
     if (refuse?.(tc)) {
       console.warn(`[WRAP-UP] Not running ${tc.function.name}: the same call already failed twice in a row.`);
       const errorMsg = refusedToolError(tc.function.name);
@@ -724,7 +730,7 @@ async function executeToolCalls(
     console.info(`Executing tool via MCP: ${tc.function.name} args: ${argsPreview}`);
     sendToolCallStarted(sessionId, tc.id, tc.function.name);
     turnHandle?.startToolSpan(tc.id, tc.function.name, parsedArgs);
-    const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs);
+    const toolResult = await mcpClient.callTool(tc.function.name, parsedArgs, ctx.signal);
     console.info(`Tool ${tc.function.name} output: ${toolResult.slice(0, 150).replace(/\n/g, ' ')}`);
     executed++;
 
@@ -907,7 +913,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
   // Transactional Snapshot BEFORE prompt execution
   session.takeSnapshot();
-  session.abortController = new AbortController();
+  const turnController = new AbortController();
+  session.abortController = turnController;
   session.activePromptId = id ?? null;
 
   session.messages.push({ role: 'user', content: promptText });
@@ -920,7 +927,7 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
     nostrMeta
   );
   session.activeTurnHandle = turnHandle ?? null;
-  const ctx: TurnContext = { id, sessionId, session, turnHandle };
+  const ctx: TurnContext = { id, sessionId, session, turnHandle, signal: turnController.signal };
 
   const maxIterations = ITERATION_LIMIT.limit;
   let iteration = 0;
@@ -928,7 +935,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
   let stop: TurnStop | null = null;
 
   try {
-    const tools = await mcpClient.getTools();
+    // The tool list comes first and may wait on a slow or reconnecting server: a cancel cuts that wait short too.
+    const tools = await mcpClient.getTools(ctx.signal);
     // Circuit breaker: 2 identical tool errors in a row, counted across the turn's iterations.
     const breaker = new ToolErrorBreaker();
 
@@ -977,6 +985,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       }
     }
 
+    // A cancel during the last iteration's tool call ends the loop by its condition: it is a cancel, not a stop.
+    throwIfCancelled(session);
     // The model did not finish the turn: the breaker stopped it, or it used every iteration of it.
     const stopped: TurnStop = stop ?? { reason: 'iteration_limit', limit: maxIterations };
     if (stopped.reason === 'iteration_limit') {
@@ -996,20 +1006,33 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
     endStoppedTurn(ctx, stopped, wrapup);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`Turn execution error in session ${sessionId}: ${msg}`);
+    // Read before the rollback below, which clears the controller: session/cancel aborts and clears it, and nothing else
+    // does. The error is whatever the aborted step threw (AbortError, a stream or a tool cut short), never the reason.
+    const cancelled = wasCancelled(session);
 
     // Rollback session state on error
     session.rollback();
 
-    const isCancelled =
-      session.abortController?.signal?.aborted ||
-      (err instanceof Error && (err.name === 'AbortError' || err.message.includes('cancellation')));
-
-    if (isCancelled) {
+    if (cancelled) {
+      // ACP: the agent MUST answer a cancelled turn with `cancelled` and catch the errors its aborted operations throw.
+      // buzz-acp takes any other stop reason as a protocol error and respawns this process, losing every session in it.
+      console.info(`Turn in session ${sessionId} cancelled by the client (${msg}); rolled back to the last checkpoint.`);
       turnHandle?.end('CANCELLED');
-    } else {
-      turnHandle?.end('ERROR', undefined, 'turn_failed', msg);
+      void telemetryService?.backgroundFlush();
+      sendResponse(id, {
+        sessionId,
+        message: {
+          role: 'assistant',
+          content: ''
+        },
+        stopReason: 'cancelled'
+      });
+      sendNotification('session/turnComplete', { sessionId });
+      return;
     }
+
+    console.error(`Turn execution error in session ${sessionId}: ${msg}`);
+    turnHandle?.end('ERROR', undefined, 'turn_failed', msg);
     void telemetryService?.backgroundFlush();
 
     sendNotification('session/update', {
@@ -1047,11 +1070,12 @@ function handleSessionSteering(id?: string | number, params?: Record<string, unk
   const session = sessionId ? sessions.get(sessionId) : undefined;
   const promptText = extractPromptText(params);
 
-  if (!session || !session.activePromptId) {
-    // Session is idle or has no running turn
+  if (!session || !session.activePromptId || wasCancelled(session)) {
+    // No running turn, or one being cancelled: its rollback would drop an injected message the client counts as
+    // delivered. promptRequired tells the client to deliver it as a prompt of its own.
     sendResponse(id, {
       outcome: 'promptRequired',
-      reason: 'noRunningTurn'
+      reason: session?.activePromptId ? 'turnCancelled' : 'noRunningTurn'
     });
     return;
   }

@@ -151,6 +151,7 @@ environment at start-up (see In-Memory Secret Sanitization).
 | :--- | :--- |
 | `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
+| `cancelled` | The client sent `session/cancel`. The model request, the tool list and the tool call in progress are cut short at once (the MCP server is told with `notifications/cancelled`; a server that ignores it may still finish that call), the answer's remaining tool calls never run, a steer that arrives after the cancel is answered `promptRequired`, and the turn is rolled back. ACP requires this stop reason; buzz-acp waits only 5 s for it, so the answer comes at once, not when a tool would end. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
 
 ### When the adapter stops a turn
@@ -256,7 +257,7 @@ only where everyone who can open the Phoenix project may read those conversation
 * **`initialize`**: Exchanges protocol version (`1`), agent metadata, and capabilities (`streaming`, `tools`, `sessionCancellation`).
 * **`session/new`**: Initializes a fresh session instance with an isolated message history and system prompt.
 * **`session/prompt`**: Executes an autonomous multi-turn prompt, streaming reasoning and text deltas.
-* **`session/cancel`**: Aborts ongoing completions, restores state to the last checkpoint, and confirms cancellation.
+* **`session/cancel`** (a notification): Aborts the running model request and tool call, stops the answer's remaining tool calls, restores state to the last checkpoint, and answers the pending `session/prompt` with `stopReason: "cancelled"`.
 
 ### Notifications
 * **`session/update`**: Emits real-time stream deltas (`type: "thought"` for reasoning, `type: "text"` for content).
