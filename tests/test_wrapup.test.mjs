@@ -38,6 +38,38 @@ test('breaker on meeting_join: one more call, and its reply is posted', async ()
   assert.match(response.result.message.content, /repetitive tool errors/);
 });
 
+test('two tools failing the same way in a row do not stop the turn: no breaker, no wrap-up', async () => {
+  // Both fail with the SDK's request timeout, as two different gate tools did at 60 s under v0.5.1.
+  const read = (n) => toolCalls([{ id: `call_${n}`, name: 'thread_read', args: '{}' }]);
+  const run = await runAdapter({
+    env: { MOCK_MCP_FAILING_TOOLS: 'meeting_wait,thread_read' },
+    reply: (res, n) => sse(res, n === 1 ? wait(n) : n === 2 ? read(n) : text('The meeting service is not answering.'))
+  });
+  assert.equal(run.requests.length, 3);
+  assert.ok(!run.requests[2].messages.some(isNotice), 'v0.5.1 stopped the turn here: one error text from two tools');
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
+  assert.equal(run.responses[0].result.message.content, 'The meeting service is not answering.');
+  assert.doesNotMatch(run.stderr, /CIRCUIT BREAKER/);
+});
+
+test('five failed tool calls in a row stop the turn, whatever their tools, and the wrap-up says so', async () => {
+  const read = (n) => toolCalls([{ id: `call_${n}`, name: 'thread_read', args: '{}' }]);
+  const run = await runAdapter({
+    env: { MOCK_MCP_FAILING_TOOLS: 'meeting_wait,thread_read' },
+    reply: (res, n) => sse(res, n <= 6 ? (n % 2 === 1 ? wait(n) : read(n)) : text('Sorry.'))
+  });
+  assert.deepEqual(run.calls, ['meeting_wait', 'thread_read', 'meeting_wait', 'thread_read', 'meeting_wait']);
+  assert.equal(run.requests.length, 7, 'five failing calls, then two wrap-up calls');
+  const notice = run.requests[5].messages.at(-1);
+  assert.ok(isNotice(notice));
+  assert.match(notice.content, /Your last 5 tool calls failed/);
+  const refused = run.requests[6].messages.at(-1);
+  assert.equal(refused.tool_call_id, 'call_6', 'the wrap-up repeat of a failed call did not run');
+  assert.match(refused.content, /already failed, and the turn is being stopped after 5 tool errors in a row/);
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
+  assert.match(run.stderr, /\[CIRCUIT BREAKER\] .*5 tool errors in a row/);
+});
+
 test('a repeat of the call that tripped the breaker is refused unrun', async () => {
   const run = await runAdapter({
     env: JOIN_FAILS,

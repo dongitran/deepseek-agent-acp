@@ -6,6 +6,7 @@
  *   meeting_join — always fails, as the meeting gate did on 2026-11-13 (agent-infra #49);
  *   shell        — like buzz-dev-mcp's shell for a shell agent: `buzz messages send …` posts, anything else times out.
  * MOCK_MCP_SLOW_TOOLS=<name>:<ms>,… holds those calls that long before answering; a cancel ends the wait.
+ * MOCK_MCP_FAILING_TOOLS=<name>,… makes those tools fail with one shared error text, as an SDK request timeout reads.
  * MOCK_MCP_SLOW_LIST=<ms> holds every tools/list that long; MOCK_MCP_LIST_LOG=<file> gets a line per tools/list on arrival.
  * MOCK_MCP_CALL_LOG=<file> appends the name of every tool called, one per line, so a test sees what really ran.
  * MOCK_MCP_CANCEL_LOG=<file> appends the name of every call the client cancelled (notifications/cancelled), on arrival.
@@ -43,6 +44,13 @@ const SLOW = Object.fromEntries(
     .filter(([name, ms]) => name && Number(ms) > 0)
     .map(([name, ms]) => [name, Number(ms)])
 );
+const FAILING = new Set(
+  (process.env.MOCK_MCP_FAILING_TOOLS ?? '')
+    .split(',')
+    .map((name) => name.trim())
+    .filter(Boolean)
+);
+const SHARED_ERROR = 'Tool execution error: MCP error -32001: Request timed out';
 const CALL_LOG = process.env.MOCK_MCP_CALL_LOG;
 const CANCEL_LOG = process.env.MOCK_MCP_CANCEL_LOG;
 
@@ -90,6 +98,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   }
   if (SLOW[name]) {
     await hold(SLOW[name], extra.signal);
+  }
+  if (FAILING.has(name)) {
+    return failed(SHARED_ERROR);
   }
   if (EXTRA.includes(name)) {
     return EXTRA_TOOLS[name](args);

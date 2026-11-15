@@ -7,8 +7,8 @@
  * - In-memory secret loading and sanitization (strips API key from process.env immediately).
  * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
  * - Transactional state checkpointing and rollback on session/cancel.
- * - Dynamic iteration limits and circuit breaker (abort if 2 identical tool errors occur in a row), then a wrap-up in
- *   which the model tells the person why the turn stopped (src/turn-stop.ts).
+ * - Dynamic iteration limits and circuit breaker (abort when one tool fails the same way twice in a row, or after 5
+ *   tool errors in a row), then a wrap-up in which the model tells the person why the turn stopped (src/turn-stop.ts).
  * - Full Model Context Protocol (MCP) tool execution, each tool call reported as ACP tool_call / tool_call_update.
  */
 
@@ -40,6 +40,7 @@ import { describeTraceSettings, resolveTraceSettings } from './trace-config.js';
 import {
   ToolErrorBreaker,
   breakerStop,
+  describeBreakerRule,
   describeTurnStop,
   isRepeatOfFailedCall,
   refusedToolError,
@@ -634,12 +635,13 @@ function recordToolCallAnswer(ctx: TurnContext, answer: ModelAnswer, toolCalls: 
 
 /** The breaker tripped on `toolName`: say so on stderr and in the update stream. */
 function reportBreakerTrip(ctx: TurnContext, toolName: string, breaker: ToolErrorBreaker): void {
-  console.warn(`[CIRCUIT BREAKER] Aborting turn: 2 identical tool errors in a row for '${toolName}'.`);
+  const why = describeBreakerRule(breaker.rule);
+  console.warn(`[CIRCUIT BREAKER] Aborting turn: ${why}, the last from '${toolName}'.`);
   sendNotification('session/update', {
     sessionId: ctx.sessionId,
     delta: {
       type: 'text',
-      text: `\n\n*(Notice: Tool execution loop aborted because 2 identical tool errors occurred in a row: ${breaker.lastError ?? ''})*`
+      text: `\n\n*(Notice: Tool execution loop aborted after ${why}: ${breaker.lastError ?? ''})*`
     }
   });
 }
@@ -679,15 +681,16 @@ function recordUnrunCall(ctx: TurnContext, tc: ToolCall, errorMsg: string): void
 
 /**
  * Runs one answer's tool calls in order through MCP, each result appended as a tool message. Circuit breaker: when a
- * result makes 2 identical tool errors in a row, the rest do not run and get a synthetic error result instead (every
- * tool call must have a result), and `tripped` is true. In a wrap-up, a call `refuse` matches (a repeat of a call that
- * tripped the breaker) does not run. `executed` counts the calls MCP ran; `posted` says one of them posted a Buzz message.
+ * result trips it (src/turn-stop.ts), the rest do not run and get a synthetic error result instead (every tool call
+ * must have a result), and `tripped` is true. In a wrap-up, a call for which `refuse` returns a refusal (a repeat of a
+ * call that tripped the breaker) does not run, and the refusal is its result. `executed` counts the calls MCP ran;
+ * `posted` says one of them posted a Buzz message.
  */
 async function executeToolCalls(
   ctx: TurnContext,
   toolCalls: ToolCall[],
   breaker: ToolErrorBreaker,
-  refuse: ((tc: ToolCall) => boolean) | null = null
+  refuse: ((tc: ToolCall) => string | null) | null = null
 ): Promise<{ tripped: boolean; executed: number; posted: boolean }> {
   const { session, sessionId, turnHandle } = ctx;
   let tripped = false;
@@ -699,12 +702,12 @@ async function executeToolCalls(
     // A cancel stops the answer's remaining calls too (ACP: stop tool calls as soon as possible): nothing more runs,
     // posts or speaks for a turn the person stopped.
     throwIfCancelled(session);
-    if (refuse?.(tc)) {
-      console.warn(`[WRAP-UP] Not running ${tc.function.name}: the same call already failed twice in a row.`);
-      const errorMsg = refusedToolError(tc.function.name);
-      recordUnrunCall(ctx, tc, errorMsg);
+    const refusal = refuse?.(tc) ?? null;
+    if (refusal) {
+      console.warn(`[WRAP-UP] Not running ${tc.function.name}: it repeats a call that tripped the breaker.`);
+      recordUnrunCall(ctx, tc, refusal);
       executedToolCallIds.add(tc.id);
-      if (breaker.record(tc.function.name, tc.function.arguments, errorMsg)) {
+      if (breaker.record(tc.function.name, tc.function.arguments, refusal)) {
         reportBreakerTrip(ctx, tc.function.name, breaker);
         tripped = true;
         break;
@@ -805,7 +808,10 @@ async function runWrapup(
     return { iterations: 0, toolCalls: 0 };
   }
   const { session, sessionId } = ctx;
-  const refuse = (tc: ToolCall): boolean => isRepeatOfFailedCall(stop, tc.function.name, tc.function.arguments);
+  const refuse = (tc: ToolCall): string | null =>
+    isRepeatOfFailedCall(stop, tc.function.name, tc.function.arguments)
+      ? refusedToolError(tc.function.name, stop.reason === 'circuit_breaker' ? stop.rule : 'repeat')
+      : null;
   const notice: ChatMessage = { role: 'user', content: wrapupNotice(stop) };
   session.messages.push(notice);
   console.info(

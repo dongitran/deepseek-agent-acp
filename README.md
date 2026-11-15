@@ -82,7 +82,8 @@ It bridges headless orchestrators, team chat relays, and multi-agent harnesses w
    * Takes atomic message snapshots before executing each turn.
    * Restores session state seamlessly to the last stable checkpoint upon client cancellation (`session/cancel`) or uncaught runtime exceptions.
 5. **Execution Circuit Breaker and Turn Limit**:
-   * Detects stagnant loops (e.g., 2 consecutive identical tool failures).
+   * Detects stagnant loops: one tool failing with the same error twice in a row, or 5 tool errors in a row whatever
+     their tools.
    * Caps the model calls per turn (`ACP_MAX_ITERATIONS`) and ends an exhausted turn with the ACP stop reason `max_turn_requests`.
    * Injects synthetic safeguards for remaining unexecuted tool calls to maintain strict OpenAI tool-call response invariants.
    * Before a turn it stopped ends, gives the model a short wrap-up to tell the person who asked why
@@ -149,14 +150,18 @@ environment at start-up (see In-Memory Secret Sanitization).
 
 | `stopReason` | When |
 | :--- | :--- |
-| `end_turn` | The model finished, or the circuit breaker stopped a loop of identical tool errors: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
+| `end_turn` | The model finished, or the circuit breaker stopped a loop of failing tool calls: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
 | `cancelled` | The client sent `session/cancel`. The model request, the tool list and the tool call in progress are cut short at once (the MCP server is told with `notifications/cancelled`; a server that ignores it may still finish that call), the answer's remaining tool calls never run, a steer that arrives after the cancel is answered `promptRequired`, and the turn is rolled back. ACP requires this stop reason; buzz-acp waits only 5 s for it, so the answer comes at once, not when a tool would end. |
 | `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
 
 ### When the adapter stops a turn
 
-The circuit breaker (2 identical tool errors in a row) and the iteration limit stop a turn the model has not finished.
+The circuit breaker and the iteration limit stop a turn the model has not finished. The breaker trips when one tool fails
+with the same error twice in a row (the same error text from another tool, such as a timeout or `Not connected`, is no
+repeat), or after 5 tool errors in a row whatever their tools; a successful call starts both counts again. A result
+that is not an error, such as a meeting gate's refusal `{"ok": false, ...}`, counts as a success.
+
 A client such as buzz-acp relays nothing the agent writes as text: the agent reaches people only through its tools (a
 reply tool, speech in a call, the `buzz` CLI). Ended there, such a turn would leave the person who asked without a
 word. So the model first gets a **wrap-up**: up to `ACP_WRAPUP_ITERATIONS` (default 2) more model calls, after one
@@ -166,8 +171,9 @@ and then stop.
 
 - **Tools.** Every tool stays offered: the one that failed may be how the agent answers (an agent that posts with its
   shell, whose commands the adapter's own tool timeout fails all alike). After the breaker, only a repeat of a call that
-  tripped it — the same tool with the same arguments, whatever their spacing or key order — is not run, and its result
-  says so. `tool_choice` is never sent: DeepSeek refuses `required` and named choices in thinking mode, the API default.
+  tripped it — the same tool with the same arguments, whatever their spacing or key order, among the calls that failed
+  in a row — is not run, and its result says so. `tool_choice` is never sent: DeepSeek refuses `required` and named
+  choices in thinking mode, the API default.
 - **No quoting.** The notice never repeats the error text. A tool's output stays in its tool message, as data, and
   never becomes an instruction from the user.
 - **End.** The wrap-up ends at its budget, on an answer without tool calls, once a tool posted a message (a Buzz
