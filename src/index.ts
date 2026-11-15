@@ -7,6 +7,8 @@
  * - In-memory secret loading and sanitization (strips API key from process.env immediately).
  * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
  * - Transactional state checkpointing and rollback on session/cancel.
+ * - Steered messages wait for the next model call and go in right before it, never between an answer's tool calls and
+ *   their results.
  * - Dynamic iteration limits and circuit breaker (abort when one tool fails the same way twice in a row, or after 5
  *   tool errors in a row), then a wrap-up in which the model tells the person why the turn stopped (src/turn-stop.ts).
  * - Full Model Context Protocol (MCP) tool execution, each tool call reported as ACP tool_call / tool_call_update.
@@ -223,6 +225,8 @@ class Session {
   public abortController: AbortController | null = null;
   public activePromptId: string | number | null = null;
   public activeTurnHandle: TurnSpanHandle | null = null;
+  /** Steered messages of the running turn that no model call has seen yet (flushSteers). */
+  public pendingSteers: ChatMessage[] = [];
 
   constructor(sessionId: string) {
     this.sessionId = sessionId;
@@ -244,6 +248,7 @@ class Session {
       this.abortController.abort();
       this.abortController = null;
     }
+    this.pendingSteers = [];
     this.messages = JSON.parse(JSON.stringify(this.checkpoint)) as ChatMessage[];
     console.info(`[TRANSACTION] Rolled back session ${this.sessionId} to previous checkpoint.`);
   }
@@ -445,6 +450,16 @@ function throwIfCancelled(session: Session): void {
   if (wasCancelled(session)) {
     throw new Error('Turn was aborted by cancellation signal.');
   }
+}
+
+/**
+ * Steered messages go into the history here, right before a model call (or when a stopped turn is committed), never
+ * when they arrive: a steer usually comes while a tool call runs, and between an answer's tool_calls and their results
+ * it makes a history the DeepSeek API refuses (HTTP 400 "An assistant message with 'tool_calls' must be followed by
+ * tool messages responding to each 'tool_call_id'").
+ */
+function flushSteers(session: Session): void {
+  session.messages.push(...session.pendingSteers.splice(0));
 }
 
 /**
@@ -813,6 +828,8 @@ async function runWrapup(
       ? refusedToolError(tc.function.name, stop.reason === 'circuit_breaker' ? stop.rule : 'repeat')
       : null;
   const notice: ChatMessage = { role: 'user', content: wrapupNotice(stop) };
+  // A steer that came during the turn's last tool call goes first: the notice stays the last word.
+  flushSteers(session);
   session.messages.push(notice);
   console.info(
     `[WRAP-UP] Session ${sessionId}: ${describeTurnStop(stop)}; giving the model up to ${budget.toString()} call(s) ` +
@@ -826,6 +843,7 @@ async function runWrapup(
   try {
     while (calls < budget) {
       throwIfCancelled(session);
+      flushSteers(session);
       calls++;
       console.info(`Wrap-up call ${calls.toString()}/${budget.toString()} for session ${sessionId}`);
       const answer = await callModel(ctx, tools, iteration + calls, { wrapup: true });
@@ -879,6 +897,8 @@ function endStoppedTurn(ctx: TurnContext, stop: TurnStop, wrapup: { iterations: 
   // A cancel that came while the last tool call ran (the turn's or the wrap-up's) must roll the turn back, not commit
   // the result that call pushed onto the restored history: the turn's catch does that.
   throwIfCancelled(session);
+  // A steer no call of this turn saw was still delivered to it: kept, so the next turn sees it.
+  flushSteers(session);
   session.commit();
   const content = stopMessageOf(stop);
   turnHandle?.recordWrapup(wrapup.iterations);
@@ -952,6 +972,8 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
 
     while (iteration < maxIterations) {
       throwIfCancelled(session);
+      // Steers that came since the last call (during its stream or its tool calls) go in after its tool results.
+      flushSteers(session);
 
       iteration++;
       console.info(`Turn iteration ${iteration.toString()}/${maxIterations.toString()} for session ${sessionId}`);
@@ -968,6 +990,17 @@ async function handleSessionPrompt(id?: string | number, params?: Record<string,
       // No tool calls means the model produced its final response text
       if (validToolCalls.length === 0) {
         recordFinalAnswer(ctx, answer);
+        if (session.pendingSteers.length > 0) {
+          if (iteration < maxIterations) {
+            // A message came while the model wrote this answer, and the client was told it reached this turn: the
+            // model answers it in one more call instead of the turn ending with it unread.
+            console.info(`[STEER] Session ${sessionId}: a steered message came during the last answer; one more call.`);
+            continue;
+          }
+          // No call left: the turn is finished all the same, and the message is kept for the next one.
+          console.info(`[STEER] Session ${sessionId}: a steered message came during the last allowed call; kept for later.`);
+          flushSteers(session);
+        }
         session.commit();
 
         const content = answer.accumulator.content || '';
@@ -1102,12 +1135,15 @@ function handleSessionSteering(id?: string | number, params?: Record<string, unk
     });
   }
 
-  // Inject into active turn messages for the model's next iteration
+  // Delivered to the running turn: the next model call sees it (flushSteers puts it in right before that call).
   const steerHeader = '[New message — arrived while you were working]';
   const steerFormatted = `${steerHeader}\n${promptText}`;
-  session.messages.push({ role: 'user', content: steerFormatted });
+  session.pendingSteers.push({ role: 'user', content: steerFormatted });
 
-  console.info(`[STEER] Injected steered message into active session ${sessionId} (event: ${nostrMeta.eventId ?? 'unknown'})`);
+  console.info(
+    `[STEER] Injected steered message into active session ${sessionId} (event: ${nostrMeta.eventId ?? 'unknown'}); ` +
+      'the next model call sees it.'
+  );
 
   sendResponse(id, { outcome: 'injected' });
 }

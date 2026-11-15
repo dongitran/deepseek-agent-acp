@@ -264,6 +264,13 @@ only where everyone who can open the Phoenix project may read those conversation
 * **`session/new`**: Initializes a fresh session instance with an isolated message history and system prompt.
 * **`session/prompt`**: Executes an autonomous multi-turn prompt, streaming reasoning and text deltas.
 * **`session/cancel`** (a notification): Aborts the running model request and tool call, stops the answer's remaining tool calls, restores state to the last checkpoint, and answers the pending `session/prompt` with `stopReason: "cancelled"`.
+* **`_session/steering`**: A message for the running turn (buzz-acp's `turn_handling: steer`), answered `injected`. It
+  goes into the history right before the turn's next model call, after the results of the tool calls in progress: the
+  DeepSeek API refuses a message between an answer's tool calls and their results (HTTP 400). One that arrives while the
+  model writes its final answer gets one more model call, so the turn answers it, unless that answer was the turn's
+  last allowed call (`ACP_MAX_ITERATIONS`): the turn then ends as finished. A stopped turn's wrap-up calls see it too.
+  One that no call of the turn saw is kept for the next turn; a cancelled turn drops it with the rest of the turn. With no turn running, or one being cancelled, the answer is `promptRequired`, and the client sends it as a
+  prompt of its own.
 
 ### Notifications
 * **`session/update`**: Emits real-time stream deltas (`type: "thought"` for reasoning, `type: "text"` for content).
