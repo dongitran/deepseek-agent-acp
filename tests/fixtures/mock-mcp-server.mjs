@@ -5,9 +5,10 @@
  * MOCK_MCP_EXTRA_TOOLS (comma-separated) adds:
  *   meeting_join — always fails, as the meeting gate did on 2026-11-13 (agent-infra #49);
  *   shell        — like buzz-dev-mcp's shell for a shell agent: `buzz messages send …` posts, anything else times out.
- * MOCK_MCP_SLOW_TOOLS=<name>:<ms>,… holds those calls that long before answering.
+ * MOCK_MCP_SLOW_TOOLS=<name>:<ms>,… holds those calls that long before answering; a cancel ends the wait.
  * MOCK_MCP_SLOW_LIST=<ms> holds every tools/list that long; MOCK_MCP_LIST_LOG=<file> gets a line per tools/list on arrival.
  * MOCK_MCP_CALL_LOG=<file> appends the name of every tool called, one per line, so a test sees what really ran.
+ * MOCK_MCP_CANCEL_LOG=<file> appends the name of every call the client cancelled (notifications/cancelled), on arrival.
  */
 import { appendFileSync } from 'node:fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -43,6 +44,22 @@ const SLOW = Object.fromEntries(
     .map(([name, ms]) => [name, Number(ms)])
 );
 const CALL_LOG = process.env.MOCK_MCP_CALL_LOG;
+const CANCEL_LOG = process.env.MOCK_MCP_CANCEL_LOG;
+
+/** Waits `ms`, or less when the client cancels the call. */
+function hold(ms, signal) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        resolve();
+      },
+      { once: true }
+    );
+  });
+}
 
 const server = new Server({ name: 'mock-meeting-mcp', version: '1.0.0' }, { capabilities: { tools: {} } });
 
@@ -63,13 +80,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   const { name, arguments: args } = request.params;
   if (CALL_LOG) {
     appendFileSync(CALL_LOG, `${name}\n`);
   }
+  if (CANCEL_LOG) {
+    extra.signal.addEventListener('abort', () => appendFileSync(CANCEL_LOG, `${name}\n`), { once: true });
+  }
   if (SLOW[name]) {
-    await new Promise((resolve) => setTimeout(resolve, SLOW[name]));
+    await hold(SLOW[name], extra.signal);
   }
   if (EXTRA.includes(name)) {
     return EXTRA_TOOLS[name](args);

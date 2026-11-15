@@ -23,6 +23,7 @@ import {
   resolveIterationLimit,
   resolveReasoningParams,
   resolveRequestTimeoutMs,
+  resolveToolTimeoutMs,
   resolveWrapupIterations
 } from './config.js';
 import {
@@ -144,18 +145,21 @@ const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
 const WRAPUP = resolveWrapupIterations(process.env);
+const TOOL_TIMEOUT = resolveToolTimeoutMs(process.env);
 for (const warning of [
   ...REASONING.warnings,
   ...ITERATION_LIMIT.warnings,
   ...REQUEST_TIMEOUT.warnings,
-  ...WRAPUP.warnings
+  ...WRAPUP.warnings,
+  ...TOOL_TIMEOUT.warnings
 ]) {
   console.warn(warning);
 }
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} wrapup_iterations=${WRAPUP.iterations.toString()}`
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} ` +
+    `wrapup_iterations=${WRAPUP.iterations.toString()} tool_timeout_ms=${TOOL_TIMEOUT.timeoutMs.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
 if (telemetryService) {
@@ -248,7 +252,7 @@ class Session {
 // 5. ACP PROTOCOL ENGINE
 // ============================================================================
 const sessions = new Map<string, Session>();
-const mcpClient = new McpClient(MCP_COMMAND);
+const mcpClient = new McpClient(MCP_COMMAND, [], { toolTimeoutMs: TOOL_TIMEOUT.timeoutMs });
 
 // Initialize MCP client in background
 mcpClient.init().catch((err: unknown) => {

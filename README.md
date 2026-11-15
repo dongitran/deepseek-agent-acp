@@ -124,12 +124,12 @@ deepseek-agent-acp
 | `DEEPSEEK_TEMPERATURE` | `0.0` | Sampling temperature. |
 | `DEEPSEEK_THINKING` | *(unset: API default)* | `enabled` or `disabled`, sent as `thinking.type`. DeepSeek models think by default, so set `disabled` for a zero-thinking agent. |
 | `DEEPSEEK_REASONING_EFFORT` | *(unset: API default)* | `none` (turns thinking off) or `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, sent as `reasoning_effort`. `DEEPSEEK_THINKING=disabled` wins over any level. |
-| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | HTTP fetch and chunk read timeout (ms). A positive integer. |
+| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | HTTP fetch and chunk read timeout (ms). A positive integer up to 2147483647. |
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
 | `ACP_MAX_ITERATIONS` | `15` (`25` for coder/builder) | Maximum model calls in one `session/prompt` turn, a positive integer (`BUZZ_MAX_ITERATIONS` is the fallback); a turn it stops still gets the wrap-up's `ACP_WRAPUP_ITERATIONS` calls. Every tool call costs one iteration, so an agent that stays in one turn for minutes (a meeting call that loops on `meeting_wait`) must raise it. |
 | `ACP_WRAPUP_ITERATIONS` | `2` | Model calls a turn still gets after the circuit breaker or the iteration limit stopped it, so the model can tell the person why: an integer from 0 to 5, `0` turns the wrap-up off. See [When the adapter stops a turn](#when-the-adapter-stops-a-turn). |
-| `MCP_TOOL_TIMEOUT_MS` | `60000` | Timeout for individual MCP tool calls (ms). |
+| `MCP_TOOL_TIMEOUT_MS` | `60000` | How long one MCP tool call may run (ms), a positive integer up to 2147483647. It is the MCP request's own timeout: at that bound the call ends with the error `Tool execution timed out after <ms>ms` and the server is told to stop it (`notifications/cancelled`). Up to 0.5.1 the SDK's default of 60 s cut every longer value to 60 s. |
 | `OTEL_*`, `PHOENIX_*` | *(unset: no tracing)* | Tracing to Arize Phoenix and what it records: see [Tracing](#-tracing-opentelemetry--arize-phoenix). |
 
 `thinking` and `reasoning_effort` are only added to the request when the matching variable is set, so endpoints
@@ -137,7 +137,7 @@ that reject unknown fields keep working. Invalid values are ignored with a warni
 settings are logged once at start-up:
 
 ```text
-[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 wrapup_iterations=2
+[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 wrapup_iterations=2 tool_timeout_ms=180000
 ```
 
 Every `DEEPSEEK_*` variable that is not a setting listed above is treated as a secret and removed from the process

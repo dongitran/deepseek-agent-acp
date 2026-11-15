@@ -157,29 +157,49 @@ export function resolveIterationLimit(env: Env, model: string): IterationLimitRe
   return { limit: isCoder ? CODER_ITERATION_LIMIT : DEFAULT_ITERATION_LIMIT, source: 'default', warnings };
 }
 
-export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+/** The longest delay a Node.js timer takes: a longer one fires after 1 ms instead (TimeoutOverflowWarning). */
+export const MAX_TIMER_MS = 2_147_483_647;
 
-export interface RequestTimeoutResolution {
+export interface TimeoutResolution {
   timeoutMs: number;
   warnings: string[];
 }
 
-/** HTTP request and stream-read timeout (ms) for one chat-completions call. */
-export function resolveRequestTimeoutMs(env: Env): RequestTimeoutResolution {
-  const raw = (env.DEEPSEEK_REQUEST_TIMEOUT_MS ?? '').trim();
+/** A timeout setting in ms: a positive integer a timer can hold, else `fallback` and a warning naming `name`. */
+function resolveTimeoutMs(env: Env, name: string, fallback: number): TimeoutResolution {
+  const raw = (env[name] ?? '').trim();
   if (raw === '') {
-    return { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS, warnings: [] };
+    return { timeoutMs: fallback, warnings: [] };
   }
   const value = parsePositiveInt(raw);
-  if (value === null) {
+  if (value === null || value > MAX_TIMER_MS) {
     return {
-      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      timeoutMs: fallback,
       warnings: [
-        `Ignoring DEEPSEEK_REQUEST_TIMEOUT_MS="${raw}": expected a positive integer; using ${DEFAULT_REQUEST_TIMEOUT_MS.toString()} ms.`
+        `Ignoring ${name}="${raw}": expected a positive integer up to ${MAX_TIMER_MS.toString()}; ` +
+          `using ${fallback.toString()} ms.`
       ]
     };
   }
   return { timeoutMs: value, warnings: [] };
+}
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+
+/** HTTP request and stream-read timeout (ms) for one chat-completions call. */
+export function resolveRequestTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'DEEPSEEK_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+}
+
+export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+
+/**
+ * MCP_TOOL_TIMEOUT_MS: how long one MCP tool call may run (ms). At that bound the call ends with an error and the MCP
+ * server is told to stop it (notifications/cancelled). It is the MCP request's own timeout: the SDK ends a request it
+ * is given without one at its default of 60 s, which used to cut every longer setting to 60 s.
+ */
+export function resolveToolTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'MCP_TOOL_TIMEOUT_MS', DEFAULT_TOOL_TIMEOUT_MS);
 }
 
 export const DEFAULT_WRAPUP_ITERATIONS = 2;

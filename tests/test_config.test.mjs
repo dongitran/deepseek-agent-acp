@@ -9,6 +9,7 @@ const {
   resolveReasoningParams,
   resolveIterationLimit,
   resolveRequestTimeoutMs,
+  resolveToolTimeoutMs,
   resolveWrapupIterations
 } = await import(path.resolve(__dirname, '../dist/config.js'));
 
@@ -180,11 +181,33 @@ test('resolveRequestTimeoutMs: defaults to 90000 and accepts a positive integer'
 });
 
 test('resolveRequestTimeoutMs: invalid values fall back to the default with a warning', () => {
-  for (const bad of ['abc', '0', '-1', '12.5', '5s']) {
+  for (const bad of ['abc', '0', '-1', '12.5', '5s', '2147483648']) {
     const resolved = resolveRequestTimeoutMs({ DEEPSEEK_REQUEST_TIMEOUT_MS: bad });
     assert.equal(resolved.timeoutMs, 90000, `"${bad}" must not be accepted`);
     assert.equal(resolved.warnings.length, 1);
     assert.match(resolved.warnings[0], /DEEPSEEK_REQUEST_TIMEOUT_MS/);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Tool call timeout (MCP_TOOL_TIMEOUT_MS)
+// ---------------------------------------------------------------------------
+
+test('resolveToolTimeoutMs: defaults to 60000 and accepts a positive integer up to the longest timer, 2147483647', () => {
+  assert.deepEqual(resolveToolTimeoutMs({}), { timeoutMs: 60000, warnings: [] });
+  assert.deepEqual(resolveToolTimeoutMs({ MCP_TOOL_TIMEOUT_MS: '' }), { timeoutMs: 60000, warnings: [] });
+  assert.deepEqual(resolveToolTimeoutMs({ MCP_TOOL_TIMEOUT_MS: ' 180000 ' }), { timeoutMs: 180000, warnings: [] });
+  assert.deepEqual(resolveToolTimeoutMs({ MCP_TOOL_TIMEOUT_MS: '2147483647' }), { timeoutMs: 2147483647, warnings: [] });
+});
+
+test('resolveToolTimeoutMs: what parseInt half-read in 0.5.1 falls back to 60000 with a warning naming the variable', () => {
+  // 0.5.1 used parseInt: "180s" became 180 ms, "abc" NaN (a 1 ms timer), and above 2147483647 a timer fires at once.
+  for (const bad of ['abc', '180s', '0', '-5', '1.5', '1e5', '2147483648']) {
+    const resolved = resolveToolTimeoutMs({ MCP_TOOL_TIMEOUT_MS: bad });
+    assert.equal(resolved.timeoutMs, 60000, `"${bad}" must not be accepted`);
+    assert.equal(resolved.warnings.length, 1);
+    assert.match(resolved.warnings[0], /MCP_TOOL_TIMEOUT_MS/);
+    assert.ok(resolved.warnings[0].includes(`"${bad}"`), 'the warning quotes the value it ignored');
   }
 });
 
