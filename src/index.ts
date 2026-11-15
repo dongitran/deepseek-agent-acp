@@ -7,6 +7,8 @@
  * - In-memory secret loading and sanitization (strips API key from process.env immediately).
  * - Safe stream parsing and synthetic error injection on token limit truncation (finish_reason === 'length').
  * - Transactional state checkpointing and rollback on session/cancel.
+ * - A model call that fails before any of its text was streamed (HTTP 408/429/5xx, a lost connection, no answer in
+ *   time) is sent again, up to DEEPSEEK_MAX_RETRIES times (src/model-retry.ts).
  * - Steered messages wait for the next model call and go in right before it, never between an answer's tool calls and
  *   their results.
  * - Dynamic iteration limits and circuit breaker (abort when one tool fails the same way twice in a row, or after 5
@@ -16,6 +18,7 @@
 
 import fs from 'node:fs';
 import readline from 'node:readline';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { format } from 'node:util';
 import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
 import { McpClient, type OpenAIFunctionTool } from './mcp-client.js';
@@ -23,11 +26,19 @@ import {
   PRESERVED_DEEPSEEK_CONFIG,
   describeReasoning,
   resolveIterationLimit,
+  resolveMaxRetries,
   resolveReasoningParams,
   resolveRequestTimeoutMs,
   resolveToolTimeoutMs,
   resolveWrapupIterations
 } from './config.js';
+import {
+  ModelEmptyStreamError,
+  ModelHttpError,
+  ModelTimeoutError,
+  isRetryableModelError,
+  retryDelayMs
+} from './model-retry.js';
 import {
   extractPostedEventId,
   initTelemetry,
@@ -147,12 +158,14 @@ const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMM
 const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
+const MAX_RETRIES = resolveMaxRetries(process.env);
 const WRAPUP = resolveWrapupIterations(process.env);
 const TOOL_TIMEOUT = resolveToolTimeoutMs(process.env);
 for (const warning of [
   ...REASONING.warnings,
   ...ITERATION_LIMIT.warnings,
   ...REQUEST_TIMEOUT.warnings,
+  ...MAX_RETRIES.warnings,
   ...WRAPUP.warnings,
   ...TOOL_TIMEOUT.warnings
 ]) {
@@ -161,7 +174,7 @@ for (const warning of [
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} ` +
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} max_retries=${MAX_RETRIES.retries.toString()} ` +
     `wrapup_iterations=${WRAPUP.iterations.toString()} tool_timeout_ms=${TOOL_TIMEOUT.timeoutMs.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
@@ -463,8 +476,13 @@ function flushSteers(session: Session): void {
 }
 
 /**
- * One streamed chat-completions call on the session's messages. Text and reasoning deltas go out as session/update.
- * Throws when the key is missing, the API refuses the request, or the stream breaks or is cancelled.
+ * One model call: a streamed chat-completions request on the session's messages (streamModelAnswer), sent again up to
+ * DEEPSEEK_MAX_RETRIES times after a failure that may pass (src/model-retry.ts) when none of its text or reasoning had
+ * reached the client. A retry repeats nothing: what a failed attempt returned was never applied (its tool calls run
+ * only after its stream has ended), so the retry sends exactly the same messages. Each attempt has an LLM span of its
+ * own; a retry's says `deepseek.retry`. A cancel during the wait before a retry ends the wait at once.
+ * Throws what the last attempt threw: the key is missing, the API refuses the request, the stream breaks or times out,
+ * or the turn is cancelled.
  */
 async function callModel(
   ctx: TurnContext,
@@ -472,8 +490,48 @@ async function callModel(
   iteration: number,
   options?: LlmSpanOptions
 ): Promise<ModelAnswer> {
+  const maxRetries = MAX_RETRIES.retries;
+  for (let retry = 0; ; retry++) {
+    const llmSpan = ctx.turnHandle?.startLlmSpan(MODEL, iteration, retry > 0 ? { ...options, retry } : options);
+    const progress = { streamed: false };
+    try {
+      return await streamModelAnswer(ctx, tools, llmSpan, progress);
+    } catch (err: unknown) {
+      if (wasCancelled(ctx.session)) {
+        throw err;
+      }
+      const msg = err instanceof Error ? err.message : String(err);
+      // An HTTP error closed its attempt's span already; any other failure left it open (what had streamed is on it).
+      if (!(err instanceof ModelHttpError)) {
+        llmSpan?.end(undefined, msg);
+      }
+      if (progress.streamed || retry >= maxRetries || !isRetryableModelError(err)) {
+        throw err;
+      }
+      const delayMs = retryDelayMs(retry + 1);
+      console.warn(
+        `[RETRY] Session ${ctx.sessionId}: model call ${iteration.toString()} failed before any of its text was ` +
+          `streamed (${msg}); sending it again in ${delayMs.toString()} ms (retry ${(retry + 1).toString()} of ` +
+          `${maxRetries.toString()}).`
+      );
+      await sleep(delayMs, undefined, { signal: ctx.signal });
+    }
+  }
+}
+
+/**
+ * One attempt of a model call. Text and reasoning deltas go out as session/update, and `progress.streamed` says some
+ * did. DEEPSEEK_REQUEST_TIMEOUT_MS bounds the wait for the response, then each wait for the next chunk of its stream
+ * (parseSSEStream): silence, not the whole answer. An attempt that fails has its connection closed; a finished one
+ * leaves it to be reused by the next call.
+ */
+async function streamModelAnswer(
+  ctx: TurnContext,
+  tools: OpenAIFunctionTool[],
+  llmSpan: LlmSpanHandle | undefined,
+  progress: { streamed: boolean }
+): Promise<ModelAnswer> {
   const { session, sessionId, turnHandle } = ctx;
-  const llmSpan = turnHandle?.startLlmSpan(MODEL, iteration, options);
 
   // Prepare messages for DeepSeek API: preserve reasoning_content (CoT Invariant)
   const messagesPayload = session.messages.map((m) => {
@@ -497,10 +555,12 @@ async function callModel(
     throw new Error('DEEPSEEK_API_KEY is missing or empty. Cannot authenticate with DeepSeek API.');
   }
 
-  // Call DeepSeek Chat Completions with Streaming (request timeout: DEEPSEEK_REQUEST_TIMEOUT_MS, default 90s)
   const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
-  const timeoutSignal = AbortSignal.timeout(requestTimeoutMs);
-  const combinedSignal = AbortSignal.any([ctx.signal, timeoutSignal]);
+  const connection = new AbortController();
+  const signal = AbortSignal.any([ctx.signal, connection.signal]);
+  // Runs until the response is known to be a stream (an error's body is read under it too); the stream's silences are
+  // then the parser's to bound.
+  const responseTimer = setTimeout(() => connection.abort(new ModelTimeoutError(requestTimeoutMs)), requestTimeoutMs);
 
   const requestBody = {
     model: MODEL,
@@ -515,61 +575,89 @@ async function callModel(
   // OTEL_CAPTURE_LLM_MESSAGES: recorded before the request, so a failed request still shows what was sent.
   llmSpan?.recordRequest(requestBody);
 
-  const response = await fetch(`${BASE_URL}/chat/completions`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${DEEPSEEK_API_KEY}`
-    },
-    body: JSON.stringify(requestBody),
-    signal: combinedSignal
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    llmSpan?.end(undefined, `DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
-    throw new Error(`DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`);
-  }
-
   // Stream accumulator for 3-phase events
   let accumulator: StreamAccumulator | null = null;
+  let dataEvents = 0;
+  let finished = false;
 
   try {
-    for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
-      if (wasCancelled(session)) {
-        recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
-        llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
-        throw new Error('Stream aborted by client cancellation.');
-      }
+    const response = await fetch(`${BASE_URL}/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`
+      },
+      body: JSON.stringify(requestBody),
+      signal
+    });
 
-      if (event.type === 'delta') {
-        if (event.reasoningDelta) {
-          sendNotification('session/update', {
-            sessionId,
-            delta: {
-              type: 'thought',
-              text: event.reasoningDelta
-            }
-          });
-        }
-        if (event.contentDelta) {
-          sendNotification('session/update', {
-            sessionId,
-            delta: {
-              type: 'text',
-              text: event.contentDelta
-            }
-          });
-        }
+    if (!response.ok) {
+      let errorText: string;
+      try {
+        errorText = await response.text();
+      } catch (bodyErr: unknown) {
+        // The status is known: it, not the body that never came, decides whether the call is sent again.
+        errorText = `(its body did not arrive: ${bodyErr instanceof Error ? bodyErr.message : String(bodyErr)})`;
       }
-      if (event.accumulator) {
-        accumulator = event.accumulator as StreamAccumulator;
-      }
+      const message = `DeepSeek API error (HTTP ${response.status.toString()}): ${errorText}`;
+      llmSpan?.end(undefined, message);
+      throw new ModelHttpError(response.status, message);
     }
-  } catch (streamErr: unknown) {
-    // The stream broke half-way (read timeout, reset): the turn's end closes this span; keep what had arrived.
-    recordPartialAnswer(llmSpan, accumulator);
-    throw streamErr;
+    clearTimeout(responseTimer);
+
+    try {
+      for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+        if (wasCancelled(session)) {
+          recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
+          llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
+          throw new Error('Stream aborted by client cancellation.');
+        }
+
+        if (event.type === 'delta') {
+          dataEvents++;
+          if (event.reasoningDelta) {
+            progress.streamed = true;
+            sendNotification('session/update', {
+              sessionId,
+              delta: {
+                type: 'thought',
+                text: event.reasoningDelta
+              }
+            });
+          }
+          if (event.contentDelta) {
+            progress.streamed = true;
+            sendNotification('session/update', {
+              sessionId,
+              delta: {
+                type: 'text',
+                text: event.contentDelta
+              }
+            });
+          }
+        }
+        if (event.accumulator) {
+          accumulator = event.accumulator as StreamAccumulator;
+        }
+      }
+    } catch (streamErr: unknown) {
+      // The stream broke half-way (silence, reset): keep what had arrived on the span; callModel closes it.
+      recordPartialAnswer(llmSpan, accumulator);
+      throw streamErr;
+    }
+    if (dataEvents === 0) {
+      // Keep-alive comments, then the end (DeepSeek closes a request it held for 10 minutes): no answer at all.
+      throw new ModelEmptyStreamError();
+    }
+    finished = true;
+  } finally {
+    clearTimeout(responseTimer);
+    if (!finished) {
+      // A stream that stopped half-way still holds its connection: close it before anything else is sent. A finished
+      // one is left alone: its last bytes may still be on their way, and closing it would cost the next call a new
+      // connection.
+      connection.abort();
+    }
   }
 
   if (!accumulator) {

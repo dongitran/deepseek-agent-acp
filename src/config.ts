@@ -20,7 +20,8 @@ export const PRESERVED_DEEPSEEK_CONFIG: ReadonlySet<string> = new Set([
   'DEEPSEEK_TEMPERATURE',
   'DEEPSEEK_THINKING',
   'DEEPSEEK_REASONING_EFFORT',
-  'DEEPSEEK_REQUEST_TIMEOUT_MS'
+  'DEEPSEEK_REQUEST_TIMEOUT_MS',
+  'DEEPSEEK_MAX_RETRIES'
 ]);
 
 // ============================================================================
@@ -186,7 +187,11 @@ function resolveTimeoutMs(env: Env, name: string, fallback: number): TimeoutReso
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
 
-/** HTTP request and stream-read timeout (ms) for one chat-completions call. */
+/**
+ * DEEPSEEK_REQUEST_TIMEOUT_MS: how long one chat-completions call may wait for its response (ms), and then for each
+ * next piece of its stream. It bounds silence, not the whole answer: a stream that keeps coming, keep-alive comments
+ * included, is never cut, and DeepSeek holds a request open with keep-alives while it is busy.
+ */
 export function resolveRequestTimeoutMs(env: Env): TimeoutResolution {
   return resolveTimeoutMs(env, 'DEEPSEEK_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
 }
@@ -200,6 +205,36 @@ export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
  */
 export function resolveToolTimeoutMs(env: Env): TimeoutResolution {
   return resolveTimeoutMs(env, 'MCP_TOOL_TIMEOUT_MS', DEFAULT_TOOL_TIMEOUT_MS);
+}
+
+export const DEFAULT_MAX_RETRIES = 2;
+export const MAX_MAX_RETRIES = 5;
+
+export interface MaxRetriesResolution {
+  retries: number;
+  warnings: string[];
+}
+
+/**
+ * DEEPSEEK_MAX_RETRIES: how many more times one model call is sent after a failure that may pass (src/model-retry.ts)
+ * and that came before any of its text reached the client. 0 turns retries off, as in 0.5.1; at most 5.
+ */
+export function resolveMaxRetries(env: Env): MaxRetriesResolution {
+  const raw = (env.DEEPSEEK_MAX_RETRIES ?? '').trim();
+  if (raw === '') {
+    return { retries: DEFAULT_MAX_RETRIES, warnings: [] };
+  }
+  const value = raw === '0' ? 0 : parsePositiveInt(raw);
+  if (value === null || value > MAX_MAX_RETRIES) {
+    return {
+      retries: DEFAULT_MAX_RETRIES,
+      warnings: [
+        `Ignoring DEEPSEEK_MAX_RETRIES="${raw}": expected an integer from 0 to ${MAX_MAX_RETRIES.toString()}; ` +
+          `using ${DEFAULT_MAX_RETRIES.toString()}.`
+      ]
+    };
+  }
+  return { retries: value, warnings: [] };
 }
 
 export const DEFAULT_WRAPUP_ITERATIONS = 2;

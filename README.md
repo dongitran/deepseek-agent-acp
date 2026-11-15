@@ -125,7 +125,8 @@ deepseek-agent-acp
 | `DEEPSEEK_TEMPERATURE` | `0.0` | Sampling temperature. |
 | `DEEPSEEK_THINKING` | *(unset: API default)* | `enabled` or `disabled`, sent as `thinking.type`. DeepSeek models think by default, so set `disabled` for a zero-thinking agent. |
 | `DEEPSEEK_REASONING_EFFORT` | *(unset: API default)* | `none` (turns thinking off) or `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, sent as `reasoning_effort`. `DEEPSEEK_THINKING=disabled` wins over any level. |
-| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | HTTP fetch and chunk read timeout (ms). A positive integer up to 2147483647. |
+| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | How long one model call waits for the response, then for each next chunk of its stream (ms): it bounds silence, not the whole answer, and keep-alive comments count. A positive integer up to 2147483647. |
+| `DEEPSEEK_MAX_RETRIES` | `2` | How many more times one model call is sent after a failure that may pass, before any of its text was streamed: an integer from 0 to 5, `0` turns retries off. See [When a model call fails](#when-a-model-call-fails). |
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
 | `ACP_MAX_ITERATIONS` | `15` (`25` for coder/builder) | Maximum model calls in one `session/prompt` turn, a positive integer (`BUZZ_MAX_ITERATIONS` is the fallback); a turn it stops still gets the wrap-up's `ACP_WRAPUP_ITERATIONS` calls. Every tool call costs one iteration, so an agent that stays in one turn for minutes (a meeting call that loops on `meeting_wait`) must raise it. |
@@ -138,7 +139,7 @@ that reject unknown fields keep working. Invalid values are ignored with a warni
 settings are logged once at start-up:
 
 ```text
-[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 wrapup_iterations=2 tool_timeout_ms=180000
+[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 max_retries=2 wrapup_iterations=2 tool_timeout_ms=180000
 ```
 
 Every `DEEPSEEK_*` variable that is not a setting listed above is treated as a secret and removed from the process
@@ -153,7 +154,28 @@ environment at start-up (see In-Memory Secret Sanitization).
 | `end_turn` | The model finished, or the circuit breaker stopped a loop of failing tool calls: the notice is streamed as text, and the [wrap-up](#when-the-adapter-stops-a-turn) runs first. |
 | `max_turn_requests` | The turn used all `ACP_MAX_ITERATIONS` model calls: a notice is streamed, the [wrap-up](#when-the-adapter-stops-a-turn) runs first, and the client may rotate the session. |
 | `cancelled` | The client sent `session/cancel`. The model request, the tool list and the tool call in progress are cut short at once (the MCP server is told with `notifications/cancelled`; a server that ignores it may still finish that call), the answer's remaining tool calls never run, a steer that arrives after the cancel is answered `promptRequired`, and the turn is rolled back. ACP requires this stop reason; buzz-acp waits only 5 s for it, so the answer comes at once, not when a tool would end. |
-| `error` | The turn failed (API error, timeout) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
+| `error` | A model call failed for good (see [When a model call fails](#when-a-model-call-fails)) and the session was rolled back. Not an ACP value: buzz-acp answers it by respawning the adapter and re-queueing the prompt. |
+
+### When a model call fails
+
+A turn can be long: a meeting twin's whole call is one turn of hundreds of model calls, and a turn that fails is rolled
+back and answered `error`. So a model call that fails in a way that may pass is sent again, up to
+`DEEPSEEK_MAX_RETRIES` times (default 2), after 1 s, then 2 s, 4 s, …:
+
+- **What is retried.** HTTP 408, 429 and 5xx (DeepSeek's 500 and 503, a gateway's 502 or 504), a connection lost
+  before or during the response, no response within `DEEPSEEK_REQUEST_TIMEOUT_MS`, a stream silent for that long, and
+  a response that ends before any data. A 400, 401, 402 or 422 is not: the same request would fail the same way.
+- **Only before any text.** A call whose text or reasoning had already been streamed to the client is not sent again,
+  so nothing is shown twice. Nothing else of a failed call is ever applied: its tool calls run only after its stream
+  has ended, so a retry sends exactly the same messages and repeats no tool call.
+- **Silence, not length.** `DEEPSEEK_REQUEST_TIMEOUT_MS` bounds the wait for the response and then each wait for the
+  next chunk of the stream. A long answer that keeps streaming is never cut. Neither is a request DeepSeek holds open
+  with keep-alive comments before it starts: its documentation says it closes such a request if inference has not
+  started within 10 minutes, and a close before any data counts as a failed attempt.
+- **Cancel.** A `session/cancel` during the wait before a retry answers `cancelled` at once.
+- Each attempt has its own LLM span; a retry's carries `deepseek.retry` (1 for the first retry). A call that fails for
+  good ends the turn with `error`, as before. `DEEPSEEK_MAX_RETRIES=0` turns retries off: the first failure ends the
+  turn.
 
 ### When the adapter stops a turn
 
@@ -196,6 +218,7 @@ Tracing is fail-open: Phoenix being slow or down never slows or breaks a turn.
 agent_turn (AGENT)          one ACP turn: input.value = the prompt, output.value = the answer, token totals
 │                           status ERROR when the adapter stopped it (below)
 ├── llm:<model> (LLM)       one per model call: token counts, output.value = the text answer
+│                           a call sent again after a failure: one span per attempt, deepseek.retry on the retries
 │                           + with OTEL_CAPTURE_LLM_MESSAGES=true: the exact request and the answer (below)
 ├── tool:<name> (TOOL)      tool.parameters, tool.output_bytes; output.value for posting tools (posted event id)
 │                           + output.value for the tools named in OTEL_CAPTURE_TOOL_OUTPUT

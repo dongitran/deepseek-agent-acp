@@ -15,6 +15,14 @@ import type {
   DeepSeekUsage
 } from './types.js';
 
+/** A stream that sent nothing, not even a keep-alive comment, for longer than its chunk timeout. */
+export class StreamReadTimeoutError extends Error {
+  constructor(timeoutMs: number) {
+    super(`Stream chunk read timed out after ${timeoutMs.toString()}ms`);
+    this.name = 'StreamReadTimeoutError';
+  }
+}
+
 export class SSEParser {
   private buffer = '';
 
@@ -177,7 +185,8 @@ export class StreamAccumulator {
 }
 
 /**
- * Async generator to parse streaming response bodies into delta events.
+ * Async generator to parse streaming response bodies into delta events. `chunkTimeoutMs` bounds each wait for the next
+ * chunk of the body (any bytes, an SSE comment included), not the whole stream: StreamReadTimeoutError when it passes.
  */
 export async function* parseSSEStream(
   stream: unknown,
@@ -200,7 +209,7 @@ export async function* parseSSEStream(
     let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<{ done: boolean; value?: Uint8Array | string }>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new Error(`Stream chunk read timed out after ${ms.toString()}ms`));
+        reject(new StreamReadTimeoutError(ms));
       }, ms);
     });
     return Promise.race([r.read(), timeoutPromise]).finally(() => {

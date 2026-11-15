@@ -605,6 +605,8 @@ export interface SteerSpanParams {
 export interface LlmSpanOptions {
   /** A call of the wrap-up after the adapter stopped the turn (src/turn-stop.ts): `deepseek.wrapup` on the span. */
   wrapup?: boolean;
+  /** A model call sent again after its attempt failed (src/model-retry.ts): `deepseek.retry` = 1 for the first retry. */
+  retry?: number;
 }
 
 export interface TurnSpanHandle {
@@ -827,7 +829,8 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                 'llm.iteration': iteration,
                 'input.value': sanitizedPrompt,
                 'input.mime_type': 'text/plain',
-                ...(spanOptions?.wrapup ? { 'deepseek.wrapup': true } : {})
+                ...(spanOptions?.wrapup ? { 'deepseek.wrapup': true } : {}),
+                ...(spanOptions?.retry ? { 'deepseek.retry': spanOptions.retry } : {})
               }
             }, rootContext);
 

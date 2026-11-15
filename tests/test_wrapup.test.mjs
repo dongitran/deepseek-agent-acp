@@ -134,7 +134,8 @@ test('after the iteration limit the wrap-up offers every tool and the turn still
 
 test('the wrap-up request failing leaves the turn as the breaker ended it', async () => {
   const run = await runAdapter({
-    env: JOIN_FAILS,
+    // A call that fails for good: with retries on, the 500 would be sent again (tests/test_model_retry.test.mjs).
+    env: { ...JOIN_FAILS, DEEPSEEK_MAX_RETRIES: '0' },
     prompts: ['Join the call', 'Are you there?'],
     reply: (res, n) => {
       if (n === 3) {
