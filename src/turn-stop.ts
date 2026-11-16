@@ -9,8 +9,17 @@
  * Side-effect-free (no logging, no environment), like config.ts, so every rule is unit-testable without the adapter.
  */
 
-/** Identical tool errors in a row that stop a turn. */
+/** The same tool failing with the same error this many times in a row stops a turn. */
 export const BREAKER_THRESHOLD = 2;
+
+/**
+ * Tool errors in a row, whatever their tools and texts, that stop a turn: the bound on a loop over different failing
+ * calls (a dead MCP server fails every tool alike), which the repeat rule does not see.
+ */
+export const BREAKER_ERRORS_IN_A_ROW = 5;
+
+/** The breaker rule that stopped a turn: a repeat (BREAKER_THRESHOLD) or errors in a row (BREAKER_ERRORS_IN_A_ROW). */
+export type BreakerRule = 'repeat' | 'errors_in_a_row';
 
 /** A tool call that failed: its tool and its arguments in canonical form (canonicalArgs). */
 export interface FailedCall {
@@ -38,35 +47,64 @@ export function canonicalArgs(raw: string): string {
   }
 }
 
-/** Counts identical tool errors in a row: a success resets the count, a different error starts a new streak. */
+function addOnce(calls: FailedCall[], call: FailedCall): void {
+  if (!calls.some((known) => known.name === call.name && known.args === call.args)) {
+    calls.push(call);
+  }
+}
+
+/**
+ * The circuit breaker. A streak is one tool failing with one error text in a row: the same error text from another tool
+ * starts a new streak (a timeout or "Not connected" reads alike from every tool), and a success ends it. Separately,
+ * every error in a row counts, whatever its tool, and a success sets that count back to 0.
+ */
 export class ToolErrorBreaker {
+  private tool: string | null = null;
   private error: string | null = null;
   private count = 0;
   private calls: FailedCall[] = [];
+  private errors = 0;
+  private failed: FailedCall[] = [];
+  private tripped: BreakerRule | null = null;
 
   /**
    * Records one tool result (`error` null or empty for a success) of the call `toolName` with its raw `args`; true when
-   * it makes BREAKER_THRESHOLD identical errors in a row.
+   * it makes BREAKER_THRESHOLD identical errors of one tool in a row, or BREAKER_ERRORS_IN_A_ROW errors in a row.
    */
   record(toolName: string, args: string, error: string | null): boolean {
     if (!error) {
+      this.tool = null;
       this.error = null;
       this.count = 0;
       this.calls = [];
+      this.errors = 0;
+      this.failed = [];
+      this.tripped = null;
       return false;
     }
-    if (error === this.error) {
+    if (toolName === this.tool && error === this.error) {
       this.count++;
     } else {
+      this.tool = toolName;
       this.error = error;
       this.count = 1;
       this.calls = [];
     }
+    this.errors++;
     const call = { name: toolName, args: canonicalArgs(args) };
-    if (!this.calls.some((known) => known.name === call.name && known.args === call.args)) {
-      this.calls.push(call);
+    addOnce(this.calls, call);
+    addOnce(this.failed, call);
+    if (this.count >= BREAKER_THRESHOLD) {
+      this.tripped = 'repeat';
+    } else if (this.errors >= BREAKER_ERRORS_IN_A_ROW) {
+      this.tripped = 'errors_in_a_row';
     }
-    return this.count >= BREAKER_THRESHOLD;
+    return this.tripped !== null;
+  }
+
+  /** The rule that tripped the breaker; null while it has not. */
+  get rule(): BreakerRule | null {
+    return this.tripped;
   }
 
   /** The error of the current streak; null after a success. */
@@ -74,7 +112,7 @@ export class ToolErrorBreaker {
     return this.error;
   }
 
-  /** The calls that make up the current streak, each once, in the order they failed. */
+  /** The calls that make up the current streak (one tool), each once, in the order they failed. */
   get streakCalls(): readonly FailedCall[] {
     return this.calls;
   }
@@ -83,26 +121,45 @@ export class ToolErrorBreaker {
   get streakTools(): readonly string[] {
     return [...new Set(this.calls.map((call) => call.name))];
   }
+
+  /** Every call of the current errors in a row, each once, in the order they failed. */
+  get failedCalls(): readonly FailedCall[] {
+    return this.failed;
+  }
 }
 
 /** Why the adapter stopped a turn the model had not finished. */
 export type TurnStop =
   | {
       readonly reason: 'circuit_breaker';
+      readonly rule: BreakerRule;
       readonly tools: readonly string[];
       readonly calls: readonly FailedCall[];
       readonly error: string;
     }
   | { readonly reason: 'iteration_limit'; readonly limit: number };
 
-/** The stop a tripped breaker makes: the calls of its streak, their tools and their common error. */
+/**
+ * The stop a tripped breaker makes: its rule, the calls that failed (a repeat's streak, or every call of the errors in
+ * a row), their tools and the last error.
+ */
 export function breakerStop(breaker: ToolErrorBreaker): TurnStop {
+  const rule = breaker.rule ?? 'repeat';
+  const calls = rule === 'errors_in_a_row' ? breaker.failedCalls : breaker.streakCalls;
   return {
     reason: 'circuit_breaker',
-    tools: [...breaker.streakTools],
-    calls: [...breaker.streakCalls],
+    rule,
+    tools: [...new Set(calls.map((call) => call.name))],
+    calls: [...calls],
     error: breaker.lastError ?? ''
   };
+}
+
+/** What tripped the breaker, as the log and the client's notice say it. */
+export function describeBreakerRule(rule: BreakerRule | null | undefined): string {
+  return rule === 'errors_in_a_row'
+    ? `${BREAKER_ERRORS_IN_A_ROW.toString()} tool errors in a row`
+    : `${BREAKER_THRESHOLD.toString()} identical tool errors in a row`;
 }
 
 /** One line for the log and the turn span's error.message. */
@@ -111,7 +168,7 @@ export function describeTurnStop(stop: TurnStop): string {
     return `iteration limit: all ${stop.limit.toString()} model calls of the turn were used (ACP_MAX_ITERATIONS)`;
   }
   const from = stop.tools.length > 0 ? stop.tools.join(', ') : 'a tool';
-  return `circuit breaker: ${BREAKER_THRESHOLD.toString()} identical tool errors in a row from ${from}`;
+  return `circuit breaker: ${describeBreakerRule(stop.rule)} from ${from}`;
 }
 
 /** The ACP stop reason: buzz-acp answers a value outside the ACP set by respawning the adapter. */
@@ -131,7 +188,7 @@ export function stopMessageOf(stop: TurnStop): string {
 // ============================================================================
 
 /**
- * A wrap-up call that does not run: a repeat — the same tool, the same arguments — of a call in the breaker's streak.
+ * A wrap-up call that does not run: a repeat — the same tool, the same arguments — of a call that tripped the breaker.
  * Every tool stays offered: the one that failed may be how the agent answers (a shell agent posts with its shell, and
  * the adapter's own tool timeout fails any command the same way), so only the call that failed is barred.
  */
@@ -158,13 +215,18 @@ function quoted(names: readonly string[]): string {
   return list.length <= 2 ? list.join(' and ') : `${list.slice(0, -1).join(', ')} and ${list.at(-1) ?? ''}`;
 }
 
-function breakerSentence(tools: readonly string[]): string {
-  const safe = tools.filter((name) => SAFE_TOOL_NAME.test(name));
+function breakerSentence(stop: Extract<TurnStop, { reason: 'circuit_breaker' }>): string {
+  const safe = stop.tools.filter((name) => SAFE_TOOL_NAME.test(name));
+  const dontRepeat = 'The turn is being stopped, so do not repeat them: the same calls will not run again.';
+  if (stop.rule === 'errors_in_a_row') {
+    const which = safe.length > 0 ? ` (your ${quoted(safe)} calls)` : '';
+    return (
+      `Your last ${BREAKER_ERRORS_IN_A_ROW.toString()} tool calls failed${which}, one after another (see their ` +
+      `results). ${dontRepeat}`
+    );
+  }
   const which = safe.length > 0 ? `Your ${quoted(safe)} calls` : 'Two of your tool calls';
-  return (
-    `${which} returned the same error twice in a row (see their last results). The turn is being stopped, so do not ` +
-    'repeat them: the same calls will not run again.'
-  );
+  return `${which} returned the same error twice in a row (see their last results). ${dontRepeat}`;
 }
 
 /**
@@ -183,7 +245,7 @@ export function wrapupNotice(stop: TurnStop): string {
   }
   return [
     WRAPUP_NOTICE_HEADER,
-    breakerSentence(stop.tools),
+    breakerSentence(stop),
     'Before the turn ends, tell the person who asked you what happened, in one short message in the language of the ' +
       'conversation: what you could not do, the reason in plain words, and what they can do now (for example, try ' +
       'again in a few minutes).',
@@ -191,7 +253,11 @@ export function wrapupNotice(stop: TurnStop): string {
   ].join('\n');
 }
 
-/** The result of a wrap-up call that did not run because it repeats a call of the breaker's streak. */
-export function refusedToolError(name: string): string {
-  return `Tool ${name.slice(0, 64)} was not run: the same call already failed twice in a row, and the turn is being stopped.`;
+/** The result of a wrap-up call that did not run because it repeats a call that tripped the breaker under `rule`. */
+export function refusedToolError(name: string, rule: BreakerRule = 'repeat'): string {
+  const tool = name.slice(0, 64);
+  return rule === 'errors_in_a_row'
+    ? `Tool ${tool} was not run: the same call already failed, and the turn is being stopped after ` +
+        `${BREAKER_ERRORS_IN_A_ROW.toString()} tool errors in a row.`
+    : `Tool ${tool} was not run: the same call already failed twice in a row, and the turn is being stopped.`;
 }

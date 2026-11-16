@@ -73,7 +73,8 @@ export async function waitFor(find, timeoutMs, what = 'the adapter') {
  * Runs `prompts` in order on one session. `reply(res, n, body)` answers the n-th chat-completions request (1-based).
  * `onPrompt(index, { send, stdout })` runs after a prompt is sent and before its response is awaited.
  * Returns the responses (in prompt order), every stdout message in order and its notifications, the request bodies, the
- * tools the MCP server ran, stderr, and — with `trace: true` — the spans Phoenix received.
+ * TCP connections they came on, the tools the MCP server ran, stderr, and — with `trace: true` — the spans Phoenix
+ * received.
  */
 export async function runAdapter({ env = {}, prompts = ['Join the call'], reply, onPrompt, trace = false }) {
   const requests = [];
@@ -87,6 +88,10 @@ export async function runAdapter({ env = {}, prompts = ['Join the call'], reply,
       requests.push(body);
       reply(res, requests.length, body);
     });
+  });
+  let connections = 0;
+  deepseek.on('connection', () => {
+    connections++;
   });
   await new Promise((resolve) => deepseek.listen(0, '127.0.0.1', resolve));
   const phoenix = trace ? await startCollector() : null;
@@ -148,6 +153,7 @@ export async function runAdapter({ env = {}, prompts = ['Join the call'], reply,
       messages: messages(),
       notifications: messages().filter((message) => message.method),
       requests,
+      connections,
       calls,
       stderr,
       spans: phoenix ? phoenix.spans : []

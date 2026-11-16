@@ -7,6 +7,8 @@
 
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
+import { resolveToolTimeoutMs } from './config.js';
 
 export interface OpenAIFunctionTool {
   type: 'function';
@@ -106,6 +108,22 @@ async function abortedFirst(work: Promise<unknown>, signal?: AbortSignal): Promi
   }
 }
 
+const REQUEST_TIMEOUT_CODE: number = ErrorCode.RequestTimeout;
+
+/** The SDK's own error for a request that outlived its `timeout` (shared/protocol.js), not a server's error -32001. */
+function isRequestTimeout(err: unknown): boolean {
+  return (
+    err instanceof McpError &&
+    err.code === REQUEST_TIMEOUT_CODE &&
+    typeof (err.data as { timeout?: unknown } | undefined)?.timeout === 'number'
+  );
+}
+
+export interface McpClientOptions {
+  /** How long one tool call may run (ms); MCP_TOOL_TIMEOUT_MS (resolveToolTimeoutMs) when left out. */
+  toolTimeoutMs?: number;
+}
+
 export class McpClient {
   public mcpCommand: string;
   public args: string[];
@@ -113,14 +131,17 @@ export class McpClient {
   public transport: StdioClientTransport | null = null;
   public cachedTools: OpenAIFunctionTool[] = [];
   public isConnected = false;
+  public readonly toolTimeoutMs: number;
   private _initPromise: Promise<void> | null = null;
 
   constructor(
     mcpCommand: string = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMMAND ?? 'buzz-dev-mcp',
-    args: string[] = []
+    args: string[] = [],
+    options: McpClientOptions = {}
   ) {
     this.mcpCommand = mcpCommand;
     this.args = args;
+    this.toolTimeoutMs = options.toolTimeoutMs ?? resolveToolTimeoutMs(process.env).timeoutMs;
   }
 
   /**
@@ -230,6 +251,7 @@ export class McpClient {
    * Call a tool via MCP. Returns result string. `signal` (the turn's) cancels the call: the SDK tells the server
    * (notifications/cancelled) and the call ends at once with an error instead of when the tool finishes — ACP asks an
    * agent to stop its tool calls as soon as a turn is cancelled, and buzz-acp waits only 5 s for the cancelled turn.
+   * A call that runs past `toolTimeoutMs` ends the same way, with a timeout error.
    */
   async callTool(name: string, args: Record<string, unknown> = {}, signal?: AbortSignal): Promise<string> {
     if (signal?.aborted) {
@@ -250,28 +272,21 @@ export class McpClient {
       return JSON.stringify({ error: `Tool execution cancelled: ${name} was not run.` });
     }
 
-    const timeoutMs = parseInt(process.env.MCP_TOOL_TIMEOUT_MS ?? '60000', 10);
-    let timerId: NodeJS.Timeout | null = null;
     // A controller of its own for each call: the turn's signal is shared by every call of a turn (hundreds in a meeting).
     const request = requestController(signal);
 
     try {
-      const callPromise = this.client.callTool(
+      // `timeout` is the request's own bound. Without it the SDK ends every request at its default of 60 s
+      // (DEFAULT_REQUEST_TIMEOUT_MSEC) whatever MCP_TOOL_TIMEOUT_MS says, and a timer of the adapter's own would answer
+      // the model while the server ran on: at the bound the SDK tells the server too, as it does for a cancel.
+      const response = (await this.client.callTool(
         {
           name,
           arguments: args
         },
         undefined,
-        { signal: request.signal }
-      );
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timerId = setTimeout(() => {
-          reject(new Error(`Tool execution timed out after ${timeoutMs.toString()}ms`));
-        }, timeoutMs);
-      });
-
-      const response = (await Promise.race([callPromise, timeoutPromise])) as {
+        { signal: request.signal, timeout: this.toolTimeoutMs }
+      )) as {
         isError?: boolean;
         content?: Array<{ type: string; text?: string }>;
       };
@@ -290,13 +305,18 @@ export class McpClient {
       if (request.signal.aborted) {
         return JSON.stringify({ error: `Tool execution cancelled: ${name} was stopped with its turn.` });
       }
+      const timeout = this.toolTimeoutMs.toString();
+      if (isRequestTimeout(err)) {
+        process.stderr.write(
+          `[deepseek-acp:WARN] MCP tool ${name} timed out after ${timeout}ms (MCP_TOOL_TIMEOUT_MS); ` +
+            'the server was told to stop it.\n'
+        );
+        return JSON.stringify({ error: `Tool execution timed out after ${timeout}ms` });
+      }
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`[deepseek-acp:ERROR] MCP tool ${name} call failed: ${msg}\n`);
       return JSON.stringify({ error: `Tool execution error: ${msg}` });
     } finally {
-      if (timerId !== null) {
-        clearTimeout(timerId);
-      }
       request.release();
     }
   }

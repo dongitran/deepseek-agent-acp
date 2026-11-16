@@ -853,7 +853,9 @@ test('DEEPSEEK_REQUEST_TIMEOUT_MS is honoured (the secret purge must not remove 
   await new Promise((resolve) => hanging.listen(0, '127.0.0.1', resolve));
   const adapter = spawnAdapter({
     DEEPSEEK_BASE_URL: `http://127.0.0.1:${hanging.address().port}`,
-    DEEPSEEK_REQUEST_TIMEOUT_MS: '400'
+    DEEPSEEK_REQUEST_TIMEOUT_MS: '400',
+    // One attempt: DEEPSEEK_MAX_RETRIES survives the purge too, or the retries would outlast this test's wait.
+    DEEPSEEK_MAX_RETRIES: '0'
   });
   try {
     adapter.send({
@@ -879,12 +881,14 @@ test('loadSecretKey purges secrets and unknown DEEPSEEK_* variables but keeps ev
     process.env.DEEPSEEK_THINKING = 'disabled';
     process.env.DEEPSEEK_REASONING_EFFORT = 'none';
     process.env.DEEPSEEK_REQUEST_TIMEOUT_MS = '1234';
+    process.env.DEEPSEEK_MAX_RETRIES = '3';
     loadSecretKey();
     const gone = ['DEEPSEEK_API_KEY', 'DEEPSEEK_SOMETHING_ELSE'].filter((k) => process.env[k] !== undefined);
     const kept = {
       DEEPSEEK_THINKING: 'disabled',
       DEEPSEEK_REASONING_EFFORT: 'none',
-      DEEPSEEK_REQUEST_TIMEOUT_MS: '1234'
+      DEEPSEEK_REQUEST_TIMEOUT_MS: '1234',
+      DEEPSEEK_MAX_RETRIES: '3'
     };
     const lost = Object.keys(kept).filter((k) => process.env[k] !== kept[k]);
     if (gone.length || lost.length) {

@@ -20,7 +20,8 @@ export const PRESERVED_DEEPSEEK_CONFIG: ReadonlySet<string> = new Set([
   'DEEPSEEK_TEMPERATURE',
   'DEEPSEEK_THINKING',
   'DEEPSEEK_REASONING_EFFORT',
-  'DEEPSEEK_REQUEST_TIMEOUT_MS'
+  'DEEPSEEK_REQUEST_TIMEOUT_MS',
+  'DEEPSEEK_MAX_RETRIES'
 ]);
 
 // ============================================================================
@@ -157,29 +158,83 @@ export function resolveIterationLimit(env: Env, model: string): IterationLimitRe
   return { limit: isCoder ? CODER_ITERATION_LIMIT : DEFAULT_ITERATION_LIMIT, source: 'default', warnings };
 }
 
-export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+/** The longest delay a Node.js timer takes: a longer one fires after 1 ms instead (TimeoutOverflowWarning). */
+export const MAX_TIMER_MS = 2_147_483_647;
 
-export interface RequestTimeoutResolution {
+export interface TimeoutResolution {
   timeoutMs: number;
   warnings: string[];
 }
 
-/** HTTP request and stream-read timeout (ms) for one chat-completions call. */
-export function resolveRequestTimeoutMs(env: Env): RequestTimeoutResolution {
-  const raw = (env.DEEPSEEK_REQUEST_TIMEOUT_MS ?? '').trim();
+/** A timeout setting in ms: a positive integer a timer can hold, else `fallback` and a warning naming `name`. */
+function resolveTimeoutMs(env: Env, name: string, fallback: number): TimeoutResolution {
+  const raw = (env[name] ?? '').trim();
   if (raw === '') {
-    return { timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS, warnings: [] };
+    return { timeoutMs: fallback, warnings: [] };
   }
   const value = parsePositiveInt(raw);
-  if (value === null) {
+  if (value === null || value > MAX_TIMER_MS) {
     return {
-      timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
+      timeoutMs: fallback,
       warnings: [
-        `Ignoring DEEPSEEK_REQUEST_TIMEOUT_MS="${raw}": expected a positive integer; using ${DEFAULT_REQUEST_TIMEOUT_MS.toString()} ms.`
+        `Ignoring ${name}="${raw}": expected a positive integer up to ${MAX_TIMER_MS.toString()}; ` +
+          `using ${fallback.toString()} ms.`
       ]
     };
   }
   return { timeoutMs: value, warnings: [] };
+}
+
+export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+
+/**
+ * DEEPSEEK_REQUEST_TIMEOUT_MS: how long one chat-completions call may wait for its response (ms), and then for each
+ * next piece of its stream. It bounds silence, not the whole answer: a stream that keeps coming, keep-alive comments
+ * included, is never cut, and DeepSeek holds a request open with keep-alives while it is busy.
+ */
+export function resolveRequestTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'DEEPSEEK_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+}
+
+export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
+
+/**
+ * MCP_TOOL_TIMEOUT_MS: how long one MCP tool call may run (ms). At that bound the call ends with an error and the MCP
+ * server is told to stop it (notifications/cancelled). It is the MCP request's own timeout: the SDK ends a request it
+ * is given without one at its default of 60 s, which used to cut every longer setting to 60 s.
+ */
+export function resolveToolTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'MCP_TOOL_TIMEOUT_MS', DEFAULT_TOOL_TIMEOUT_MS);
+}
+
+export const DEFAULT_MAX_RETRIES = 2;
+export const MAX_MAX_RETRIES = 5;
+
+export interface MaxRetriesResolution {
+  retries: number;
+  warnings: string[];
+}
+
+/**
+ * DEEPSEEK_MAX_RETRIES: how many more times one model call is sent after a failure that may pass (src/model-retry.ts)
+ * and that came before any of its text reached the client. 0 turns retries off, as in 0.5.1; at most 5.
+ */
+export function resolveMaxRetries(env: Env): MaxRetriesResolution {
+  const raw = (env.DEEPSEEK_MAX_RETRIES ?? '').trim();
+  if (raw === '') {
+    return { retries: DEFAULT_MAX_RETRIES, warnings: [] };
+  }
+  const value = raw === '0' ? 0 : parsePositiveInt(raw);
+  if (value === null || value > MAX_MAX_RETRIES) {
+    return {
+      retries: DEFAULT_MAX_RETRIES,
+      warnings: [
+        `Ignoring DEEPSEEK_MAX_RETRIES="${raw}": expected an integer from 0 to ${MAX_MAX_RETRIES.toString()}; ` +
+          `using ${DEFAULT_MAX_RETRIES.toString()}.`
+      ]
+    };
+  }
+  return { retries: value, warnings: [] };
 }
 
 export const DEFAULT_WRAPUP_ITERATIONS = 2;
