@@ -115,6 +115,30 @@ test('a request that never answers is sent again after DEEPSEEK_REQUEST_TIMEOUT_
   assert.match(run.stderr, /\[RETRY\] .*timeout/i);
 });
 
+test('keep-alives do not extend the first useful-event deadline', async () => {
+  let keepAliveTimer;
+  const run = await runAdapter({
+    env: {
+      DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '250',
+      DEEPSEEK_REQUEST_TIMEOUT_MS: '1000',
+      DEEPSEEK_MAX_RETRIES: '1'
+    },
+    reply: (res, n) => {
+      if (n > 1) {
+        sse(res, text('Started.'));
+        return;
+      }
+      res.writeHead(200, SSE_HEADERS);
+      keepAliveTimer = setInterval(() => res.write(': keep-alive\n\n'), 75);
+      res.on('close', () => clearInterval(keepAliveTimer));
+    }
+  });
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
+  assert.equal(run.responses[0].result.message.content, 'Started.');
+  assert.equal(run.requests.length, 2);
+  assert.match(run.stderr, /first useful event timed out/i);
+});
+
 test('DEEPSEEK_REQUEST_TIMEOUT_MS bounds each silence of the stream, not the whole stream', async () => {
   // DeepSeek holds a busy request open with keep-alive comments, then streams: 2.5 s in all, every chunk 100 ms apart.
   const answer = 'A long answer that streams in many small pieces.';

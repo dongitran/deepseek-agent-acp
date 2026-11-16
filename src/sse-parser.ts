@@ -23,6 +23,15 @@ export class StreamReadTimeoutError extends Error {
   }
 }
 
+/** A stream sent only transport keep-alives before its first useful event. */
+export class FirstEventTimeoutError extends StreamReadTimeoutError {
+  constructor(timeoutMs: number) {
+    super(timeoutMs);
+    this.message = `Stream first useful event timed out after ${timeoutMs.toString()}ms`;
+    this.name = 'FirstEventTimeoutError';
+  }
+}
+
 export class SSEParser {
   private buffer = '';
 
@@ -185,12 +194,13 @@ export class StreamAccumulator {
 }
 
 /**
- * Async generator to parse streaming response bodies into delta events. `chunkTimeoutMs` bounds each wait for the next
- * chunk of the body (any bytes, an SSE comment included), not the whole stream: StreamReadTimeoutError when it passes.
+ * Async generator to parse streaming response bodies into delta events. The first useful event has its own absolute
+ * deadline; keep-alive comments do not extend it. After that, chunkTimeoutMs bounds silence between useful events.
  */
 export async function* parseSSEStream(
   stream: unknown,
-  chunkTimeoutMs = 60000
+  chunkTimeoutMs = 60000,
+  firstEventTimeoutMs = chunkTimeoutMs
 ): AsyncGenerator<StreamYieldEvent, void, unknown> {
   const parser = new SSEParser();
   const accumulator = new StreamAccumulator();
@@ -205,11 +215,11 @@ export async function* parseSSEStream(
   const reader: StreamReader | null =
     typeof streamWithReader?.getReader === 'function' ? streamWithReader.getReader() : null;
 
-  const readWithTimeout = (r: StreamReader, ms: number) => {
+  const readWithTimeout = (r: StreamReader, ms: number, firstEvent: boolean, reportedTimeoutMs: number) => {
     let timer: NodeJS.Timeout | undefined;
     const timeoutPromise = new Promise<{ done: boolean; value?: Uint8Array | string }>((_, reject) => {
       timer = setTimeout(() => {
-        reject(new StreamReadTimeoutError(ms));
+        reject(firstEvent ? new FirstEventTimeoutError(reportedTimeoutMs) : new StreamReadTimeoutError(reportedTimeoutMs));
       }, ms);
     });
     return Promise.race([r.read(), timeoutPromise]).finally(() => {
@@ -221,8 +231,16 @@ export async function* parseSSEStream(
 
   try {
     if (reader) {
+      let hasUsefulEvent = false;
+      let deadline = Date.now() + firstEventTimeoutMs;
       while (true) {
-        const { done, value } = await readWithTimeout(reader, chunkTimeoutMs);
+        const timeoutMs = Math.max(1, deadline - Date.now());
+        const { done, value } = await readWithTimeout(
+          reader,
+          timeoutMs,
+          !hasUsefulEvent,
+          hasUsefulEvent ? chunkTimeoutMs : firstEventTimeoutMs
+        );
         if (done) {
           break;
         }
@@ -230,10 +248,21 @@ export async function* parseSSEStream(
         const events = parser.feed(text);
         for (const ev of events) {
           if (ev.done) {
+            hasUsefulEvent = true;
             yield { type: 'done', accumulator };
             return;
           }
           const deltaResult = accumulator.processChunk(ev.data);
+          const useful = Boolean(
+            deltaResult.reasoningDelta ||
+              deltaResult.contentDelta ||
+              (deltaResult.toolCallChunks && deltaResult.toolCallChunks.length > 0) ||
+              deltaResult.finishReason
+          );
+          if (useful) {
+            hasUsefulEvent = true;
+            deadline = Date.now() + chunkTimeoutMs;
+          }
           yield { type: 'delta', ...deltaResult, accumulator };
         }
       }

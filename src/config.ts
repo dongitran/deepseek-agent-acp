@@ -21,6 +21,7 @@ export const PRESERVED_DEEPSEEK_CONFIG: ReadonlySet<string> = new Set([
   'DEEPSEEK_THINKING',
   'DEEPSEEK_REASONING_EFFORT',
   'DEEPSEEK_REQUEST_TIMEOUT_MS',
+  'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS',
   'DEEPSEEK_MAX_RETRIES'
 ]);
 
@@ -186,6 +187,7 @@ function resolveTimeoutMs(env: Env, name: string, fallback: number): TimeoutReso
 }
 
 export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
+export const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 300_000;
 
 /**
  * DEEPSEEK_REQUEST_TIMEOUT_MS: how long one chat-completions call may wait for its response (ms), and then for each
@@ -194,6 +196,11 @@ export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
  */
 export function resolveRequestTimeoutMs(env: Env): TimeoutResolution {
   return resolveTimeoutMs(env, 'DEEPSEEK_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+}
+
+/** Maximum time from response headers until the first useful SSE event; keep-alive comments do not extend it. */
+export function resolveFirstEventTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS', DEFAULT_FIRST_EVENT_TIMEOUT_MS);
 }
 
 export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;

@@ -25,6 +25,7 @@ import { McpClient, type OpenAIFunctionTool } from './mcp-client.js';
 import {
   PRESERVED_DEEPSEEK_CONFIG,
   describeReasoning,
+  resolveFirstEventTimeoutMs,
   resolveIterationLimit,
   resolveMaxRetries,
   resolveReasoningParams,
@@ -158,6 +159,7 @@ const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMM
 const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
+const FIRST_EVENT_TIMEOUT = resolveFirstEventTimeoutMs(process.env);
 const MAX_RETRIES = resolveMaxRetries(process.env);
 const WRAPUP = resolveWrapupIterations(process.env);
 const TOOL_TIMEOUT = resolveToolTimeoutMs(process.env);
@@ -165,6 +167,7 @@ for (const warning of [
   ...REASONING.warnings,
   ...ITERATION_LIMIT.warnings,
   ...REQUEST_TIMEOUT.warnings,
+  ...FIRST_EVENT_TIMEOUT.warnings,
   ...MAX_RETRIES.warnings,
   ...WRAPUP.warnings,
   ...TOOL_TIMEOUT.warnings
@@ -174,7 +177,8 @@ for (const warning of [
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} max_retries=${MAX_RETRIES.retries.toString()} ` +
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} first_event_timeout_ms=${FIRST_EVENT_TIMEOUT.timeoutMs.toString()} ` +
+    `max_retries=${MAX_RETRIES.retries.toString()} ` +
     `wrapup_iterations=${WRAPUP.iterations.toString()} tool_timeout_ms=${TOOL_TIMEOUT.timeoutMs.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
@@ -606,7 +610,7 @@ async function streamModelAnswer(
     clearTimeout(responseTimer);
 
     try {
-      for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+      for await (const event of parseSSEStream(response.body, requestTimeoutMs, FIRST_EVENT_TIMEOUT.timeoutMs)) {
         if (wasCancelled(session)) {
           recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
           llmSpan?.end(undefined, 'Stream aborted by client cancellation.');

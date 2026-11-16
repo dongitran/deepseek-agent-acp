@@ -142,3 +142,25 @@ test('parseSSEStream async generator processes chunks from async iterable', asyn
   assert.equal(finalAccumulator.content, 'Hello World');
   assert.equal(finalAccumulator.finishReason, 'stop');
 });
+
+test('parseSSEStream does not let keep-alive comments extend the first useful-event deadline', async () => {
+  let reads = 0;
+  const reader = {
+    async read() {
+      reads += 1;
+      await new Promise((resolve) => setTimeout(resolve, 35));
+      return { done: false, value: ': keep-alive\n\n' };
+    },
+    releaseLock() {}
+  };
+  const stream = { getReader: () => reader };
+  await assert.rejects(
+    async () => {
+      for await (const _event of parseSSEStream(stream, 1000, 80)) {
+        // The stream never produces a useful event.
+      }
+    },
+    (error) => error.name === 'FirstEventTimeoutError'
+  );
+  assert.ok(reads >= 2, 'the parser observed keep-alives before the absolute deadline');
+});

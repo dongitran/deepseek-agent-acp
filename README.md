@@ -125,7 +125,8 @@ deepseek-agent-acp
 | `DEEPSEEK_TEMPERATURE` | `0.0` | Sampling temperature. |
 | `DEEPSEEK_THINKING` | *(unset: API default)* | `enabled` or `disabled`, sent as `thinking.type`. DeepSeek models think by default, so set `disabled` for a zero-thinking agent. |
 | `DEEPSEEK_REASONING_EFFORT` | *(unset: API default)* | `none` (turns thinking off) or `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, sent as `reasoning_effort`. `DEEPSEEK_THINKING=disabled` wins over any level. |
-| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | How long one model call waits for the response, then for each next chunk of its stream (ms): it bounds silence, not the whole answer, and keep-alive comments count. A positive integer up to 2147483647. |
+| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | How long one model call waits for the response, then for silence between useful stream events (ms). A positive integer up to 2147483647. |
+| `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` | `300000` | How long a stream may send only keep-alive comments before its first useful event (ms). Keep-alives do not extend this bound. |
 | `DEEPSEEK_MAX_RETRIES` | `2` | How many more times one model call is sent after a failure that may pass, before any of its text was streamed: an integer from 0 to 5, `0` turns retries off. See [When a model call fails](#when-a-model-call-fails). |
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
@@ -168,10 +169,9 @@ back and answered `error`. So a model call that fails in a way that may pass is 
 - **Only before any text.** A call whose text or reasoning had already been streamed to the client is not sent again,
   so nothing is shown twice. Nothing else of a failed call is ever applied: its tool calls run only after its stream
   has ended, so a retry sends exactly the same messages and repeats no tool call.
-- **Silence, not length.** `DEEPSEEK_REQUEST_TIMEOUT_MS` bounds the wait for the response and then each wait for the
-  next chunk of the stream. A long answer that keeps streaming is never cut. Neither is a request DeepSeek holds open
-  with keep-alive comments before it starts: its documentation says it closes such a request if inference has not
-  started within 10 minutes, and a close before any data counts as a failed attempt.
+- **Useful progress, not transport traffic.** `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` bounds the wait for the first content,
+  reasoning, tool-call, finish, or `[DONE]` event. Keep-alive comments do not extend it. After the first useful event,
+  `DEEPSEEK_REQUEST_TIMEOUT_MS` bounds silence between useful events and is not a maximum answer length.
 - **Cancel.** A `session/cancel` during the wait before a retry answers `cancelled` at once.
 - Each attempt has its own LLM span; a retry's carries `deepseek.retry` (1 for the first retry). A call that fails for
   good ends the turn with `error`, as before. `DEEPSEEK_MAX_RETRIES=0` turns retries off: the first failure ends the

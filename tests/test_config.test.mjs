@@ -8,6 +8,7 @@ const {
   PRESERVED_DEEPSEEK_CONFIG,
   resolveReasoningParams,
   resolveIterationLimit,
+  resolveFirstEventTimeoutMs,
   resolveRequestTimeoutMs,
   resolveToolTimeoutMs,
   resolveMaxRetries,
@@ -26,6 +27,7 @@ test('PRESERVED_DEEPSEEK_CONFIG lists every documented DEEPSEEK_* setting and no
     'DEEPSEEK_THINKING',
     'DEEPSEEK_REASONING_EFFORT',
     'DEEPSEEK_REQUEST_TIMEOUT_MS',
+    'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS',
     'DEEPSEEK_MAX_RETRIES'
   ]) {
     assert.ok(PRESERVED_DEEPSEEK_CONFIG.has(name), `${name} must survive the secret purge`);
@@ -188,6 +190,23 @@ test('resolveRequestTimeoutMs: invalid values fall back to the default with a wa
     assert.equal(resolved.timeoutMs, 90000, `"${bad}" must not be accepted`);
     assert.equal(resolved.warnings.length, 1);
     assert.match(resolved.warnings[0], /DEEPSEEK_REQUEST_TIMEOUT_MS/);
+  }
+});
+
+test('resolveFirstEventTimeoutMs: defaults to 300000 and accepts a positive integer', () => {
+  assert.deepEqual(resolveFirstEventTimeoutMs({}), { timeoutMs: 300000, warnings: [] });
+  assert.deepEqual(resolveFirstEventTimeoutMs({ DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '45000' }), {
+    timeoutMs: 45000,
+    warnings: []
+  });
+});
+
+test('resolveFirstEventTimeoutMs: invalid values fall back with a warning', () => {
+  for (const bad of ['abc', '0', '-1', '12.5', '2147483648']) {
+    const resolved = resolveFirstEventTimeoutMs({ DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: bad });
+    assert.equal(resolved.timeoutMs, 300000);
+    assert.equal(resolved.warnings.length, 1);
+    assert.match(resolved.warnings[0], /DEEPSEEK_FIRST_EVENT_TIMEOUT_MS/);
   }
 });
 
