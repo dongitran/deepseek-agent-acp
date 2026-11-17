@@ -9,13 +9,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  ModelEmptyStreamError,
   ModelHttpError,
   ModelTimeoutError,
   isRetryableModelError,
   isRetryableStatus,
+  isStall,
   retryDelayMs
 } from '../dist/model-retry.js';
-import { StreamReadTimeoutError } from '../dist/sse-parser.js';
+import { FirstEventTimeoutError, StreamReadTimeoutError } from '../dist/sse-parser.js';
 import { runAdapter, sse, text, toolCalls, waitFor, SESSION_ID } from './helpers/acp.mjs';
 
 const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
@@ -319,4 +321,19 @@ test('isRetryableModelError: a retryable status, no response in time, a silent s
 
 test('retryDelayMs: 1 s, then twice as long each time', () => {
   assert.deepEqual([1, 2, 3, 4, 5].map(retryDelayMs), [1000, 2000, 4000, 8000, 16000]);
+});
+
+test('isStall: the model never started (no useful event in time, or a stream that ended without one)', () => {
+  assert.equal(isStall(new FirstEventTimeoutError(300000, 287)), true);
+  assert.equal(isStall(new ModelEmptyStreamError()), true);
+  for (const other of [
+    new ModelTimeoutError(90000),
+    new StreamReadTimeoutError(90000),
+    new ModelHttpError(503, 'overloaded'),
+    new TypeError('fetch failed')
+  ]) {
+    assert.equal(isStall(other), false, other.message);
+  }
+  assert.equal(isRetryableModelError(new FirstEventTimeoutError(300000, 0)), true, 'a stall may pass: it is sent again');
+  assert.match(new ModelEmptyStreamError().message, /ended before any data.*finish_reason/);
 });
