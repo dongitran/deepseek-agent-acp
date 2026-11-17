@@ -20,11 +20,20 @@ import fs from 'node:fs';
 import readline from 'node:readline';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { format } from 'node:util';
-import { StreamAccumulator, parseSSEStream } from './sse-parser.js';
+import {
+  DEFAULT_FINISH_GRACE_MS,
+  FirstEventTimeoutError,
+  StreamAccumulator,
+  parseSSEStream,
+  type StreamEnd,
+  type StreamStats
+} from './sse-parser.js';
 import { McpClient, type OpenAIFunctionTool } from './mcp-client.js';
 import {
   PRESERVED_DEEPSEEK_CONFIG,
   describeReasoning,
+  resolveFallbackModel,
+  resolveFirstEventTimeoutMs,
   resolveIterationLimit,
   resolveMaxRetries,
   resolveReasoningParams,
@@ -37,8 +46,10 @@ import {
   ModelHttpError,
   ModelTimeoutError,
   isRetryableModelError,
+  isStall,
   retryDelayMs
 } from './model-retry.js';
+import { ModelRouter } from './model-route.js';
 import {
   extractPostedEventId,
   initTelemetry,
@@ -158,6 +169,8 @@ const MCP_COMMAND = process.env.ACP_MCP_COMMAND ?? process.env.BUZZ_ACP_MCP_COMM
 const REASONING = resolveReasoningParams(process.env);
 const ITERATION_LIMIT = resolveIterationLimit(process.env, MODEL);
 const REQUEST_TIMEOUT = resolveRequestTimeoutMs(process.env);
+const FIRST_EVENT_TIMEOUT = resolveFirstEventTimeoutMs(process.env);
+const FALLBACK = resolveFallbackModel(process.env, MODEL);
 const MAX_RETRIES = resolveMaxRetries(process.env);
 const WRAPUP = resolveWrapupIterations(process.env);
 const TOOL_TIMEOUT = resolveToolTimeoutMs(process.env);
@@ -165,6 +178,8 @@ for (const warning of [
   ...REASONING.warnings,
   ...ITERATION_LIMIT.warnings,
   ...REQUEST_TIMEOUT.warnings,
+  ...FIRST_EVENT_TIMEOUT.warnings,
+  ...FALLBACK.warnings,
   ...MAX_RETRIES.warnings,
   ...WRAPUP.warnings,
   ...TOOL_TIMEOUT.warnings
@@ -174,7 +189,9 @@ for (const warning of [
 console.info(
   `[config] model=${MODEL} thinking=${describeReasoning(REASONING.params)} ` +
     `max_iterations=${ITERATION_LIMIT.limit.toString()} (${ITERATION_LIMIT.source}) ` +
-    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} max_retries=${MAX_RETRIES.retries.toString()} ` +
+    `request_timeout_ms=${REQUEST_TIMEOUT.timeoutMs.toString()} ` +
+    `first_event_timeout_ms=${FIRST_EVENT_TIMEOUT.timeoutMs.toString()} fallback_model=${FALLBACK.model ?? 'none'} ` +
+    `max_retries=${MAX_RETRIES.retries.toString()} ` +
     `wrapup_iterations=${WRAPUP.iterations.toString()} tool_timeout_ms=${TOOL_TIMEOUT.timeoutMs.toString()}`
 );
 // The trace settings matter only when spans are exported (an OTLP endpoint is set).
@@ -272,6 +289,8 @@ class Session {
 // ============================================================================
 const sessions = new Map<string, Session>();
 const mcpClient = new McpClient(MCP_COMMAND, [], { toolTimeoutMs: TOOL_TIMEOUT.timeoutMs });
+/** Which model each attempt goes to (src/model-route.ts): one per process, since every session asks the same model. */
+const router = new ModelRouter(MODEL, FALLBACK.model);
 
 // Initialize MCP client in background
 mcpClient.init().catch((err: unknown) => {
@@ -481,6 +500,8 @@ function flushSteers(session: Session): void {
  * reached the client. A retry repeats nothing: what a failed attempt returned was never applied (its tool calls run
  * only after its stream has ended), so the retry sends exactly the same messages. Each attempt has an LLM span of its
  * own; a retry's says `deepseek.retry`. A cancel during the wait before a retry ends the wait at once.
+ * A stall (the model never started) sends the next attempt to DEEPSEEK_FALLBACK_MODEL at once, and every call to it
+ * while the primary model cools down (src/model-route.ts); any other failure is sent to the same model after a wait.
  * Throws what the last attempt threw: the key is missing, the API refuses the request, the stream breaks or times out,
  * or the turn is cancelled.
  */
@@ -491,11 +512,19 @@ async function callModel(
   options?: LlmSpanOptions
 ): Promise<ModelAnswer> {
   const maxRetries = MAX_RETRIES.retries;
+  // The model the previous attempt of this call stalled on, if it stalled.
+  let stalledOn: string | null = null;
   for (let retry = 0; ; retry++) {
-    const llmSpan = ctx.turnHandle?.startLlmSpan(MODEL, iteration, retry > 0 ? { ...options, retry } : options);
+    const route = router.route(Date.now(), stalledOn);
+    const llmSpan = ctx.turnHandle?.startLlmSpan(route.model, iteration, retry > 0 ? { ...options, retry } : options);
     const progress = { streamed: false };
     try {
-      return await streamModelAnswer(ctx, tools, llmSpan, progress);
+      const firstEventTimeoutMs = router.firstEventTimeoutMs(route, FIRST_EVENT_TIMEOUT.timeoutMs);
+      const answer = await streamModelAnswer(ctx, tools, llmSpan, progress, route.model, firstEventTimeoutMs);
+      if (router.noteAnswer(route.model)) {
+        console.info(`[FALLBACK] ${MODEL} answered again: calls go back to it from ${FALLBACK.model ?? ''}.`);
+      }
+      return answer;
     } catch (err: unknown) {
       if (wasCancelled(ctx.session)) {
         throw err;
@@ -505,31 +534,67 @@ async function callModel(
       if (!(err instanceof ModelHttpError)) {
         llmSpan?.end(undefined, msg);
       }
+      stalledOn = isStall(err) ? route.model : null;
+      const cooldownMs = stalledOn ? router.noteStall(stalledOn, Date.now()) : 0;
+      if (cooldownMs > 0) {
+        console.warn(
+          `[FALLBACK] ${MODEL} stalled (${msg}); calls go to ${FALLBACK.model ?? ''} for the next ` +
+            `${(cooldownMs / 1000).toString()} s.`
+        );
+      }
       if (progress.streamed || retry >= maxRetries || !isRetryableModelError(err)) {
         throw err;
       }
-      const delayMs = retryDelayMs(retry + 1);
+      // A stall goes to the other model's queue at once; anything else waits before the same model again.
+      const next = router.route(Date.now(), stalledOn);
+      const delayMs = next.model === route.model ? retryDelayMs(retry + 1) : 0;
       console.warn(
         `[RETRY] Session ${ctx.sessionId}: model call ${iteration.toString()} failed before any of its text was ` +
-          `streamed (${msg}); sending it again in ${delayMs.toString()} ms (retry ${(retry + 1).toString()} of ` +
-          `${maxRetries.toString()}).`
+          `streamed (${msg}); sending it ${delayMs > 0 ? `again in ${delayMs.toString()} ms` : `to ${next.model} at once`} ` +
+          `(retry ${(retry + 1).toString()} of ${maxRetries.toString()}).`
       );
-      await sleep(delayMs, undefined, { signal: ctx.signal });
+      if (delayMs > 0) {
+        await sleep(delayMs, undefined, { signal: ctx.signal });
+      }
     }
   }
 }
 
+/** How a stream that was not plain went, for the log: why it ended. */
+const STREAM_ENDS: Record<StreamEnd, string> = {
+  done: 'it ended with [DONE]',
+  server_close: 'the server closed it',
+  finish_grace: 'it was taken at the grace after its finish_reason, with no [DONE]',
+  first_event: 'no useful event came within DEEPSEEK_FIRST_EVENT_TIMEOUT_MS',
+  silence: 'it went silent'
+};
+
+/** One line for a stream that was not plain: keep-alives came (DeepSeek held it), or the finish grace ended it. */
+function logStream(model: string, stats: StreamStats): void {
+  if (stats.keepAlives === 0 && stats.end !== 'finish_grace') {
+    return;
+  }
+  const first = stats.firstEventMs === null ? 'no useful event' : `first useful event after ${stats.firstEventMs.toString()} ms`;
+  console.info(
+    `[STREAM] ${model}: ${stats.keepAlives.toString()} keep-alive comment(s), ${first}; ` +
+      `${stats.end ? STREAM_ENDS[stats.end] : 'it failed'}.`
+  );
+}
+
 /**
- * One attempt of a model call. Text and reasoning deltas go out as session/update, and `progress.streamed` says some
- * did. DEEPSEEK_REQUEST_TIMEOUT_MS bounds the wait for the response, then each wait for the next chunk of its stream
- * (parseSSEStream): silence, not the whole answer. An attempt that fails has its connection closed; a finished one
- * leaves it to be reused by the next call.
+ * One attempt of a model call, to `model`. Text and reasoning deltas go out as session/update, and `progress.streamed`
+ * says some did. DEEPSEEK_REQUEST_TIMEOUT_MS bounds the wait for the response headers and the silences of its stream;
+ * `firstEventTimeoutMs` bounds the wait from sending the request to its first useful event, which keep-alive comments
+ * never extend (parseSSEStream). A stream with no useful event at all is a failed attempt. An attempt that fails has its
+ * connection closed; a finished one leaves it to be reused by the next call.
  */
 async function streamModelAnswer(
   ctx: TurnContext,
   tools: OpenAIFunctionTool[],
   llmSpan: LlmSpanHandle | undefined,
-  progress: { streamed: boolean }
+  progress: { streamed: boolean },
+  model: string,
+  firstEventTimeoutMs: number
 ): Promise<ModelAnswer> {
   const { session, sessionId, turnHandle } = ctx;
 
@@ -558,12 +623,22 @@ async function streamModelAnswer(
   const requestTimeoutMs = REQUEST_TIMEOUT.timeoutMs;
   const connection = new AbortController();
   const signal = AbortSignal.any([ctx.signal, connection.signal]);
-  // Runs until the response is known to be a stream (an error's body is read under it too); the stream's silences are
-  // then the parser's to bound.
-  const responseTimer = setTimeout(() => connection.abort(new ModelTimeoutError(requestTimeoutMs)), requestTimeoutMs);
+  // Runs until the response is known to be a stream (an error's body is read under it too); the stream is then the
+  // parser's to bound. When the first-event deadline comes first, a request with no headers by then has not started
+  // either: a stall, not a lost connection.
+  const responseTimer = setTimeout(
+    () =>
+      connection.abort(
+        firstEventTimeoutMs <= requestTimeoutMs
+          ? new FirstEventTimeoutError(firstEventTimeoutMs, 0)
+          : new ModelTimeoutError(requestTimeoutMs)
+      ),
+    Math.min(requestTimeoutMs, firstEventTimeoutMs)
+  );
+  const stats: StreamStats = { keepAlives: 0, firstEventMs: null, usefulEvents: 0, end: null };
 
   const requestBody = {
-    model: MODEL,
+    model,
     messages: messagesPayload,
     tools: tools && tools.length > 0 ? tools : undefined,
     temperature: TEMPERATURE,
@@ -577,10 +652,10 @@ async function streamModelAnswer(
 
   // Stream accumulator for 3-phase events
   let accumulator: StreamAccumulator | null = null;
-  let dataEvents = 0;
   let finished = false;
 
   try {
+    const sentAt = Date.now();
     const response = await fetch(`${BASE_URL}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -606,7 +681,12 @@ async function streamModelAnswer(
     clearTimeout(responseTimer);
 
     try {
-      for await (const event of parseSSEStream(response.body, requestTimeoutMs)) {
+      for await (const event of parseSSEStream(response.body, requestTimeoutMs, {
+        sentAt,
+        firstEventTimeoutMs,
+        finishGraceMs: Math.min(DEFAULT_FINISH_GRACE_MS, requestTimeoutMs),
+        stats
+      })) {
         if (wasCancelled(session)) {
           recordPartialAnswer(llmSpan, event.accumulator as StreamAccumulator);
           llmSpan?.end(undefined, 'Stream aborted by client cancellation.');
@@ -614,7 +694,6 @@ async function streamModelAnswer(
         }
 
         if (event.type === 'delta') {
-          dataEvents++;
           if (event.reasoningDelta) {
             progress.streamed = true;
             sendNotification('session/update', {
@@ -645,13 +724,16 @@ async function streamModelAnswer(
       recordPartialAnswer(llmSpan, accumulator);
       throw streamErr;
     }
-    if (dataEvents === 0) {
-      // Keep-alive comments, then the end (DeepSeek closes a request it held for 10 minutes): no answer at all.
+    if (stats.usefulEvents === 0) {
+      // Keep-alive comments and metadata (the role-only chunk every DeepSeek stream opens with), then the end: DeepSeek
+      // closes a request it held for 10 minutes that way. No answer at all, never an empty one.
       throw new ModelEmptyStreamError();
     }
-    finished = true;
+    // A stream the finish grace ended is still sending keep-alives: its connection is no use to the next call.
+    finished = stats.end !== 'finish_grace';
   } finally {
     clearTimeout(responseTimer);
+    logStream(model, stats);
     if (!finished) {
       // A stream that stopped half-way still holds its connection: close it before anything else is sent. A finished
       // one is left alone: its last bytes may still be on their way, and closing it would cost the next call a new
