@@ -9,6 +9,9 @@
  * - Transactional state checkpointing and rollback on session/cancel.
  * - A model call that fails before any of its text was streamed (HTTP 408/429/5xx, a lost connection, no answer in
  *   time) is sent again, up to DEEPSEEK_MAX_RETRIES times (src/model-retry.ts).
+ * - A request DeepSeek holds in its queue with keep-alive comments is cut at DEEPSEEK_FIRST_EVENT_TIMEOUT_MS
+ *   (src/sse-parser.ts); with DEEPSEEK_FALLBACK_MODEL it goes to that model, and so do the next calls while the
+ *   primary cools down (src/model-route.ts).
  * - Steered messages wait for the next model call and go in right before it, never between an answer's tool calls and
  *   their results.
  * - Dynamic iteration limits and circuit breaker (abort when one tool fails the same way twice in a row, or after 5
