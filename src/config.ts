@@ -21,6 +21,8 @@ export const PRESERVED_DEEPSEEK_CONFIG: ReadonlySet<string> = new Set([
   'DEEPSEEK_THINKING',
   'DEEPSEEK_REASONING_EFFORT',
   'DEEPSEEK_REQUEST_TIMEOUT_MS',
+  'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS',
+  'DEEPSEEK_FALLBACK_MODEL',
   'DEEPSEEK_MAX_RETRIES'
 ]);
 
@@ -188,12 +190,57 @@ function resolveTimeoutMs(env: Env, name: string, fallback: number): TimeoutReso
 export const DEFAULT_REQUEST_TIMEOUT_MS = 90_000;
 
 /**
- * DEEPSEEK_REQUEST_TIMEOUT_MS: how long one chat-completions call may wait for its response (ms), and then for each
- * next piece of its stream. It bounds silence, not the whole answer: a stream that keeps coming, keep-alive comments
- * included, is never cut, and DeepSeek holds a request open with keep-alives while it is busy.
+ * DEEPSEEK_REQUEST_TIMEOUT_MS: how long one chat-completions call may wait for its response headers (ms), then go
+ * without a single byte before its first useful event (a keep-alive proves the connection alive), then go without a
+ * useful event once the answer has started. It bounds silence, not the whole answer. Keep-alives never extend a
+ * started answer, nor DEEPSEEK_FIRST_EVENT_TIMEOUT_MS (src/sse-parser.ts).
  */
 export function resolveRequestTimeoutMs(env: Env): TimeoutResolution {
   return resolveTimeoutMs(env, 'DEEPSEEK_REQUEST_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS);
+}
+
+export const DEFAULT_FIRST_EVENT_TIMEOUT_MS = 300_000;
+
+/**
+ * DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: from sending a request to its first useful event (text, reasoning, a tool call or a
+ * finish), whatever comes before it. DeepSeek admits a request it cannot serve yet with HTTP 200 and keeps it open with
+ * `: keep-alive` comments for up to 10 minutes (about 15 were seen on 14 Sep 2026); those comments are not progress.
+ * The default stays under that close and long enough not to give up on a slow but moving queue when nothing else can
+ * answer: a caller with DEEPSEEK_FALLBACK_MODEL and a person waiting sets it much lower.
+ */
+export function resolveFirstEventTimeoutMs(env: Env): TimeoutResolution {
+  return resolveTimeoutMs(env, 'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS', DEFAULT_FIRST_EVENT_TIMEOUT_MS);
+}
+
+export interface FallbackModelResolution {
+  /** The model a stalled call goes to; null when there is none. */
+  model: string | null;
+  warnings: string[];
+}
+
+/** A model id: letters, digits and `._:/-`, starting with a letter or digit (another endpoint may use `vendor/model`). */
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+
+/**
+ * DEEPSEEK_FALLBACK_MODEL: the model a call goes to when DEEPSEEK_MODEL stalls (no useful event in time, or a stream
+ * that ends without one), and every call while that model cools down (src/model-route.ts). Unset, nothing changes
+ * models. The model itself, or a value that is no model id, is ignored with a warning.
+ */
+export function resolveFallbackModel(env: Env, model: string): FallbackModelResolution {
+  const raw = (env.DEEPSEEK_FALLBACK_MODEL ?? '').trim();
+  if (raw === '') {
+    return { model: null, warnings: [] };
+  }
+  if (!MODEL_ID.test(raw)) {
+    return { model: null, warnings: [`Ignoring DEEPSEEK_FALLBACK_MODEL="${raw}": expected a model id; no fallback model.`] };
+  }
+  if (raw === model) {
+    return {
+      model: null,
+      warnings: [`Ignoring DEEPSEEK_FALLBACK_MODEL="${raw}": it is DEEPSEEK_MODEL itself; no fallback model.`]
+    };
+  }
+  return { model: raw, warnings: [] };
 }
 
 export const DEFAULT_TOOL_TIMEOUT_MS = 60_000;
