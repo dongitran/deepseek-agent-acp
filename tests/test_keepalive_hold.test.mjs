@@ -8,7 +8,7 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { runAdapter, sse, text, waitFor, SESSION_ID } from './helpers/acp.mjs';
+import { runAdapter, sse, text, toolCalls, waitFor, SESSION_ID } from './helpers/acp.mjs';
 
 const SSE_HEADERS = { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' };
 const ROLE_ONLY = { choices: [{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }] };
@@ -40,7 +40,8 @@ test('a request held with keep-alives is cut at DEEPSEEK_FIRST_EVENT_TIMEOUT_MS 
   assert.equal(run.responses[0].result.message.content, 'Here.');
   assert.deepEqual(run.requests.map((request) => request.model), ['deepseek-flash', 'deepseek-flash']);
   const gap = deepseek.arrivals[1] - deepseek.arrivals[0];
-  assert.ok(gap >= 1200 && gap < 2500, `sent again ${gap} ms later: the 300 ms deadline, then the 1 s backoff`);
+  // Taken at the mock server: the first request's connection setup is in it, hence the slack under load.
+  assert.ok(gap >= 1000 && gap < 3000, `sent again ${gap} ms later: the 300 ms deadline, then the 1 s backoff`);
   assert.match(run.stderr, /\[RETRY\] .*DEEPSEEK_FIRST_EVENT_TIMEOUT_MS/);
   assert.match(run.stderr, /\[STREAM\] deepseek-flash: \d+ keep-alive/);
 });
@@ -108,6 +109,26 @@ test('a complete answer followed by keep-alives without [DONE] is taken after th
   assert.equal(run.responses[0].result.message.content, 'Done.');
   assert.equal(run.requests.length, 1);
   assert.match(run.stderr, /\[STREAM\] deepseek-flash: .*finish_reason/);
+});
+
+test('a tool-call answer followed by keep-alives without [DONE] still runs its tool, once', async () => {
+  // A meeting twin answers with tool calls, and the finish_reason comes in a chunk of its own.
+  const run = await runAdapter({
+    env: { DEEPSEEK_REQUEST_TIMEOUT_MS: '1000' },
+    reply: (res, n) => {
+      if (n > 1) {
+        sse(res, text('Done.'));
+        return;
+      }
+      hold(res);
+      for (const chunk of toolCalls([{ id: 'call_1', name: 'meeting_wait', args: '{}' }])) {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+    }
+  });
+  assert.equal(run.responses[0].result.stopReason, 'end_turn');
+  assert.deepEqual(run.calls, ['meeting_wait'], 'the answer was taken and its tool ran, not sent again');
+  assert.equal(run.requests.length, 2);
 });
 
 test('a stream with only the role chunk and [DONE] is sent again, never taken as an empty answer', async () => {

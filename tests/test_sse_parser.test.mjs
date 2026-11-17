@@ -259,6 +259,25 @@ test('a finish_reason then keep-alives without [DONE]: the answer is taken after
   assert.equal(stats.end, 'finish_grace');
 });
 
+test('the finish chunk DeepSeek sends (empty content, finish_reason, usage) then keep-alives: taken after the grace', async () => {
+  // DeepSeek ends every answer with {"delta":{"content":""},"finish_reason":…,"usage":…}: the finish alone is progress.
+  const stats = newStats();
+  const finish = sse({
+    choices: [{ index: 0, delta: { content: '' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }
+  });
+  const body = scriptedBody([
+    { delay: 5, text: text('Done.') },
+    { delay: 5, text: finish },
+    { delay: 20, text: KEEPALIVE, repeat: 1000 }
+  ]);
+  const run = await drain(body, 1000, { finishGraceMs: 100, stats });
+  assert.equal(run.error, null, String(run.error));
+  assert.equal(stats.end, 'finish_grace');
+  assert.equal(stats.usefulEvents, 2, 'the text and the finish');
+  assert.equal(run.events.at(-1).accumulator.usage.total_tokens, 12);
+});
+
 test('a long answer that started before the first-event deadline runs past it', async () => {
   const stats = newStats();
   const body = scriptedBody([
