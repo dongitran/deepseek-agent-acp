@@ -11,7 +11,7 @@
  * Side-effect-free (no logging, no environment, no timers), like config.ts and turn-stop.ts.
  */
 
-import { StreamReadTimeoutError } from './sse-parser.js';
+import { FirstEventTimeoutError, StreamReadTimeoutError } from './sse-parser.js';
 
 /** The wait before the first retry; each next one waits twice as long (1 s, 2 s, 4 s, …). */
 export const RETRY_BASE_DELAY_MS = 1_000;
@@ -36,13 +36,18 @@ export class ModelTimeoutError extends Error {
 }
 
 /**
- * The response ended before any data: no answer, not even its first chunk. DeepSeek holds a request it cannot serve yet
- * open with keep-alive comments and closes it if inference has not started within 10 minutes; such a close is a failed
- * attempt, not an empty answer.
+ * The response ended before any useful event: no text, reasoning, tool call or finish, at most metadata (every
+ * DeepSeek stream opens with a role-only chunk) and keep-alive comments. DeepSeek closes a request it held this way if
+ * inference has not started within 10 minutes; such a close is a failed attempt, never an empty answer.
  */
 export class ModelEmptyStreamError extends Error {
-  constructor() {
-    super('DeepSeek API stream ended before any data');
+  /** `finishReason`: the one the stream ended with, if any (`insufficient_system_resource` when DeepSeek was overloaded). */
+  constructor(finishReason: string | null = null) {
+    super(
+      finishReason
+        ? `DeepSeek API stream ended before any data of an answer (finish_reason ${finishReason}, no text, reasoning or tool call)`
+        : 'DeepSeek API stream ended before any data of an answer (no text, reasoning, tool call or finish_reason)'
+    );
     this.name = 'ModelEmptyStreamError';
   }
 }
@@ -57,9 +62,10 @@ export function isRetryableStatus(status: number): boolean {
 }
 
 /**
- * A failure that may pass: a retryable HTTP status, no response in time, a stream that went silent or ended before any
- * data, or the connection lost — undici's fetch rejects with `TypeError: fetch failed` before the response and
- * `TypeError: terminated` when the body is cut. Anything else (a missing key, a cancel) is not sent again.
+ * A failure that may pass: a retryable HTTP status, no response in time, a stream that went silent, gave no useful
+ * event in time or ended before one, or the connection lost — undici's fetch rejects with `TypeError: fetch failed`
+ * before the response and `TypeError: terminated` when the body is cut. Anything else (a missing key, a cancel) is not
+ * sent again.
  */
 export function isRetryableModelError(err: unknown): boolean {
   if (err instanceof ModelHttpError) {
@@ -68,11 +74,21 @@ export function isRetryableModelError(err: unknown): boolean {
   if (
     err instanceof ModelTimeoutError ||
     err instanceof StreamReadTimeoutError ||
+    err instanceof FirstEventTimeoutError ||
     err instanceof ModelEmptyStreamError
   ) {
     return true;
   }
   return err instanceof TypeError && (err.message === 'fetch failed' || err.message === 'terminated');
+}
+
+/**
+ * A stall: the model never started — no useful event within DEEPSEEK_FIRST_EVENT_TIMEOUT_MS, or a stream that ended
+ * without one. Unlike a lost connection or an HTTP error, sending it to the same model again only queues it again:
+ * src/model-route.ts sends it to DEEPSEEK_FALLBACK_MODEL when one is set.
+ */
+export function isStall(err: unknown): boolean {
+  return err instanceof FirstEventTimeoutError || err instanceof ModelEmptyStreamError;
 }
 
 /** The wait (ms) before retry number `retry` (1 for the first). */

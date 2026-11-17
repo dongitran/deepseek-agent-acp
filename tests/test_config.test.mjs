@@ -9,6 +9,8 @@ const {
   resolveReasoningParams,
   resolveIterationLimit,
   resolveRequestTimeoutMs,
+  resolveFirstEventTimeoutMs,
+  resolveFallbackModel,
   resolveToolTimeoutMs,
   resolveMaxRetries,
   resolveWrapupIterations
@@ -26,6 +28,8 @@ test('PRESERVED_DEEPSEEK_CONFIG lists every documented DEEPSEEK_* setting and no
     'DEEPSEEK_THINKING',
     'DEEPSEEK_REASONING_EFFORT',
     'DEEPSEEK_REQUEST_TIMEOUT_MS',
+    'DEEPSEEK_FIRST_EVENT_TIMEOUT_MS',
+    'DEEPSEEK_FALLBACK_MODEL',
     'DEEPSEEK_MAX_RETRIES'
   ]) {
     assert.ok(PRESERVED_DEEPSEEK_CONFIG.has(name), `${name} must survive the secret purge`);
@@ -188,6 +192,41 @@ test('resolveRequestTimeoutMs: invalid values fall back to the default with a wa
     assert.equal(resolved.timeoutMs, 90000, `"${bad}" must not be accepted`);
     assert.equal(resolved.warnings.length, 1);
     assert.match(resolved.warnings[0], /DEEPSEEK_REQUEST_TIMEOUT_MS/);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// First useful event and fallback model (a request DeepSeek holds with keep-alives, issue #6)
+// ---------------------------------------------------------------------------
+
+test('resolveFirstEventTimeoutMs: 300000 by default; a positive integer; invalid values warn and fall back', () => {
+  assert.deepEqual(resolveFirstEventTimeoutMs({}), { timeoutMs: 300000, warnings: [] });
+  assert.deepEqual(resolveFirstEventTimeoutMs({ DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '15000' }), {
+    timeoutMs: 15000,
+    warnings: []
+  });
+  for (const bad of ['0', '-1', '1.5', 'abc', '2147483648']) {
+    const resolved = resolveFirstEventTimeoutMs({ DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: bad });
+    assert.equal(resolved.timeoutMs, 300000, bad);
+    assert.equal(resolved.warnings.length, 1, bad);
+    assert.match(resolved.warnings[0], /DEEPSEEK_FIRST_EVENT_TIMEOUT_MS/);
+  }
+});
+
+test('resolveFallbackModel: off when unset; a model id; the primary itself or an odd value is ignored with a warning', () => {
+  assert.deepEqual(resolveFallbackModel({}, 'deepseek-flash'), { model: null, warnings: [] });
+  assert.deepEqual(resolveFallbackModel({ DEEPSEEK_FALLBACK_MODEL: '  ' }, 'deepseek-flash'), { model: null, warnings: [] });
+  assert.deepEqual(resolveFallbackModel({ DEEPSEEK_FALLBACK_MODEL: ' deepseek-v4-pro ' }, 'deepseek-flash'), {
+    model: 'deepseek-v4-pro',
+    warnings: []
+  });
+  // Another OpenAI-compatible endpoint (DEEPSEEK_BASE_URL) may name its models with a slash.
+  assert.equal(resolveFallbackModel({ DEEPSEEK_FALLBACK_MODEL: 'deepseek/deepseek-v4-pro' }, 'x').model, 'deepseek/deepseek-v4-pro');
+  for (const bad of ['deepseek-flash', 'two words', 'a'.repeat(129), 'x"y', '-leading-dash']) {
+    const resolved = resolveFallbackModel({ DEEPSEEK_FALLBACK_MODEL: bad }, 'deepseek-flash');
+    assert.equal(resolved.model, null, bad);
+    assert.equal(resolved.warnings.length, 1, bad);
+    assert.match(resolved.warnings[0], /DEEPSEEK_FALLBACK_MODEL/);
   }
 });
 

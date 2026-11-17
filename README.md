@@ -88,7 +88,12 @@ It bridges headless orchestrators, team chat relays, and multi-agent harnesses w
    * Injects synthetic safeguards for remaining unexecuted tool calls to maintain strict OpenAI tool-call response invariants.
    * Before a turn it stopped ends, gives the model a short wrap-up to tell the person who asked why
      ([When the adapter stops a turn](#when-the-adapter-stops-a-turn)).
-6. **Full Model Context Protocol (MCP) Integration**:
+6. **Queue Holds and a Fallback Model**:
+   * A request DeepSeek holds in its queue with keep-alive comments is cut at `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS`
+     instead of being waited out ([When a model call fails](#when-a-model-call-fails)).
+   * With `DEEPSEEK_FALLBACK_MODEL`, a stalled call goes to another model, and so do the next calls while the first
+     one cools down.
+7. **Full Model Context Protocol (MCP) Integration**:
    * Discovers tools dynamically from connected MCP servers and translates them to OpenAI function schemas.
    * Automatically sanitizes child process environments while preserving required authorization tokens and signing keys.
    * Reports every tool call to the client as ACP `tool_call` / `tool_call_update` updates.
@@ -125,7 +130,9 @@ deepseek-agent-acp
 | `DEEPSEEK_TEMPERATURE` | `0.0` | Sampling temperature. |
 | `DEEPSEEK_THINKING` | *(unset: API default)* | `enabled` or `disabled`, sent as `thinking.type`. DeepSeek models think by default, so set `disabled` for a zero-thinking agent. |
 | `DEEPSEEK_REASONING_EFFORT` | *(unset: API default)* | `none` (turns thinking off) or `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, sent as `reasoning_effort`. `DEEPSEEK_THINKING=disabled` wins over any level. |
-| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | How long one model call waits for the response, then for each next chunk of its stream (ms): it bounds silence, not the whole answer, and keep-alive comments count. A positive integer up to 2147483647. |
+| `DEEPSEEK_REQUEST_TIMEOUT_MS`| `90000` | How long one model call waits for its response headers, then for a byte before its first useful event (a keep-alive comment counts there), then for each next useful event once the answer has started (ms): it bounds silence, not the whole answer. A positive integer up to 2147483647. |
+| `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` | `300000` | The most a model call waits from sending its request to its first useful event (text, reasoning, a tool call or a finish), whatever comes before it: keep-alive comments never extend it. A positive integer up to 2147483647. With a fallback model and a person waiting, set it much lower (a meeting twin: `15000`). |
+| `DEEPSEEK_FALLBACK_MODEL` | *(unset: none)* | A model that takes a call when `DEEPSEEK_MODEL` stalls, and every call while that model cools down, for example `deepseek-v4-pro`. It gets the same messages, tools and parameters. Ignored, with a warning, when it is `DEEPSEEK_MODEL` itself. |
 | `DEEPSEEK_MAX_RETRIES` | `2` | How many more times one model call is sent after a failure that may pass, before any of its text was streamed: an integer from 0 to 5, `0` turns retries off. See [When a model call fails](#when-a-model-call-fails). |
 | `ACP_MCP_COMMAND` | `buzz-dev-mcp` | Command to launch the Stdio MCP tool server. |
 | `ACP_SYSTEM_PROMPT_FILE` | `./system-prompt.md` | Path to custom system instructions. |
@@ -139,7 +146,7 @@ that reject unknown fields keep working. Invalid values are ignored with a warni
 settings are logged once at start-up:
 
 ```text
-[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 max_retries=2 wrapup_iterations=2 tool_timeout_ms=180000
+[config] model=deepseek-flash thinking=disabled max_iterations=10000 (ACP_MAX_ITERATIONS) request_timeout_ms=90000 first_event_timeout_ms=15000 fallback_model=deepseek-v4-pro max_retries=2 wrapup_iterations=2 tool_timeout_ms=180000
 ```
 
 Every `DEEPSEEK_*` variable that is not a setting listed above is treated as a secret and removed from the process
@@ -163,18 +170,44 @@ back and answered `error`. So a model call that fails in a way that may pass is 
 `DEEPSEEK_MAX_RETRIES` times (default 2), after 1 s, then 2 s, 4 s, …:
 
 - **What is retried.** HTTP 408, 429 and 5xx (DeepSeek's 500 and 503, a gateway's 502 or 504), a connection lost
-  before or during the response, no response within `DEEPSEEK_REQUEST_TIMEOUT_MS`, a stream silent for that long, and
-  a response that ends before any data. A 400, 401, 402 or 422 is not: the same request would fail the same way.
+  before or during the response, no response within `DEEPSEEK_REQUEST_TIMEOUT_MS`, a stream silent for that long, no
+  useful event within `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS`, and a response that ends before any useful event. A 400, 401,
+  402 or 422 is not: the same request would fail the same way.
 - **Only before any text.** A call whose text or reasoning had already been streamed to the client is not sent again,
   so nothing is shown twice. Nothing else of a failed call is ever applied: its tool calls run only after its stream
   has ended, so a retry sends exactly the same messages and repeats no tool call.
-- **Silence, not length.** `DEEPSEEK_REQUEST_TIMEOUT_MS` bounds the wait for the response and then each wait for the
-  next chunk of the stream. A long answer that keeps streaming is never cut. Neither is a request DeepSeek holds open
-  with keep-alive comments before it starts: its documentation says it closes such a request if inference has not
-  started within 10 minutes, and a close before any data counts as a failed attempt.
+- **Progress, not traffic.** A useful event is a chunk with text, reasoning or tool-call pieces, or a `finish_reason`
+  that ends an answer (`insufficient_system_resource`, DeepSeek's "no resources to run it", ends none). Keep-alive
+  comments and metadata-only chunks (the role-only chunk that opens every DeepSeek stream) are not progress:
+  - from sending the request, the first useful event must come within `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS`, and until it
+    some byte must come within `DEEPSEEK_REQUEST_TIMEOUT_MS` (a keep-alive counts there: a silent connection is still
+    cut at that bound);
+  - once the answer has started, each next useful event must come within `DEEPSEEK_REQUEST_TIMEOUT_MS`. A long answer
+    that keeps streaming is never cut, but keep-alives no longer hold a stalled one open;
+  - after a `finish_reason`, the answer waits at most 5 s (`DEEPSEEK_REQUEST_TIMEOUT_MS` if shorter) for `[DONE]`,
+    then is taken as it is.
+- **A request DeepSeek holds.** DeepSeek admits a request it cannot serve yet with HTTP 200 and then sends only
+  `: keep-alive` comments; its documentation says it closes such a request if inference has not started within 10
+  minutes (about 15 were seen on 14 September 2026, when Flash's scheduler was stuck for hours while `deepseek-v4-pro`
+  answered at once). Such a **stall** (no useful event in time, or a stream that ends without one) is a failed attempt
+  like the others, never an empty answer.
+  - With `DEEPSEEK_FALLBACK_MODEL` set, the attempt after a stall goes to that model at once, and so does every call
+    of the process while the primary model cools down: 60 s after a stall, doubled at each stall in a row, at most
+    10 minutes. After the cooldown the next call tries the primary again; its answer ends the cooldown.
+  - An attempt on the fallback model waits at least 60 s for its first event, since its prompt cache starts cold.
+    The switch uses one of the `DEEPSEEK_MAX_RETRIES` attempts; any other failure is sent to the same model again,
+    after the usual wait.
+  - Without a fallback model, a stall is sent to the same model again, after the usual wait.
+- **Worst case.** Before its first useful event, an attempt takes at most `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` (at least
+  60 s on the fallback model), and a call makes at most `DEEPSEEK_MAX_RETRIES + 1` attempts, plus the waits between
+  them: about 15 minutes with the defaults, where 0.5.2 waited for as long as DeepSeek held each attempt (30–45
+  minutes). A meeting twin with `15000` and a fallback model waits 15 s before the fallback takes the call. If both
+  models stall, a call takes at most three attempts of 15 s on the primary or 60 s on the fallback: about 135 s
+  when it starts during a cooldown (fallback, primary, fallback), 90 s otherwise.
 - **Cancel.** A `session/cancel` during the wait before a retry answers `cancelled` at once.
-- Each attempt has its own LLM span; a retry's carries `deepseek.retry` (1 for the first retry). A call that fails for
-  good ends the turn with `error`, as before. `DEEPSEEK_MAX_RETRIES=0` turns retries off: the first failure ends the
+- Each attempt has its own LLM span, named after the model it asked; a retry's carries `deepseek.retry` (1 for the
+  first retry), a fallback attempt's `deepseek.fallback`. A call that fails for good ends the turn with `error`, as
+  before. `DEEPSEEK_MAX_RETRIES=0` turns retries off: the first failure ends the
   turn.
 
 ### When the adapter stops a turn
@@ -219,6 +252,8 @@ agent_turn (AGENT)          one ACP turn: input.value = the prompt, output.value
 │                           status ERROR when the adapter stopped it (below)
 ├── llm:<model> (LLM)       one per model call: token counts, output.value = the text answer
 │                           a call sent again after a failure: one span per attempt, deepseek.retry on the retries
+│                           how its stream went: deepseek.first_event_ms, deepseek.keepalives, deepseek.stream_end
+│                           sent to DEEPSEEK_FALLBACK_MODEL: named after it, deepseek.fallback(_reason)
 │                           + with OTEL_CAPTURE_LLM_MESSAGES=true: the exact request and the answer (below)
 ├── tool:<name> (TOOL)      tool.parameters, tool.output_bytes; output.value for posting tools (posted event id)
 │                           + output.value for the tools named in OTEL_CAPTURE_TOOL_OUTPUT
@@ -230,8 +265,16 @@ A turn the adapter stopped ends with status ERROR and no `output.value`: `error.
 model calls, whose LLM spans carry `deepseek.wrapup = true`. A message the wrap-up posted links the turn by
 `nostr.posted_event_id`.
 
-Everything beyond that is opt-in. With none of these variables set, every span of a turn the model finishes is exactly
-what 0.3.0 wrote.
+Every LLM span whose attempt got a stream, or no headers by the first-event deadline, says how it went:
+`deepseek.first_event_ms` (from sending the request to its first useful event, when one came), `deepseek.keepalives`
+(the keep-alive comments it had) and `deepseek.stream_end`: `done`, `server_close`, `finish_grace` (taken after its `finish_reason` without `[DONE]`), or
+the bound that cut it, `first_event` or `silence`. An attempt sent to `DEEPSEEK_FALLBACK_MODEL` also carries
+`deepseek.fallback = true` and `deepseek.fallback_reason`: `stall` when the primary model stalled on this call,
+`cooldown` while it cools down from an earlier stall. An attempt that ended with an HTTP error, or that was cancelled
+mid-stream, has an error status and none of the stream attributes.
+
+Everything beyond that is opt-in. With none of these variables set, every span of a turn the model finishes is what
+0.3.0 wrote, plus those three stream attributes on each LLM span.
 
 | Variable | Default | Meaning |
 | :--- | :--- | :--- |

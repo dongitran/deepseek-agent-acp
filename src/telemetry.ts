@@ -26,6 +26,7 @@ import {
   toolOutputMatcher,
   type TraceSettings
 } from './trace-config.js';
+import type { StreamStats } from './sse-parser.js';
 import type { ChatMessage, DeepSeekUsage } from './types.js';
 
 // ============================================================================
@@ -584,6 +585,11 @@ export interface LlmSpanHandle {
    * ended. Never throws.
    */
   recordOutput(message: LlmOutputMessage): void;
+  /**
+   * How the attempt's stream went (src/sse-parser.ts): `deepseek.first_event_ms` when a useful event came,
+   * `deepseek.keepalives`, and `deepseek.stream_end` when it ended or a bound cut it. Nothing once the span ended.
+   */
+  recordStream(stats: Pick<StreamStats, 'firstEventMs' | 'keepAlives' | 'end'>): void;
   end(outputValue?: string, errorMessage?: string): void;
 }
 
@@ -607,6 +613,11 @@ export interface LlmSpanOptions {
   wrapup?: boolean;
   /** A model call sent again after its attempt failed (src/model-retry.ts): `deepseek.retry` = 1 for the first retry. */
   retry?: number;
+  /**
+   * An attempt sent to DEEPSEEK_FALLBACK_MODEL (src/model-route.ts): `deepseek.fallback` and `deepseek.fallback_reason`,
+   * `stall` when the primary model stalled on this call, `cooldown` while it cools down from an earlier stall.
+   */
+  fallback?: 'stall' | 'cooldown' | null;
 }
 
 export interface TurnSpanHandle {
@@ -830,7 +841,10 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                 'input.value': sanitizedPrompt,
                 'input.mime_type': 'text/plain',
                 ...(spanOptions?.wrapup ? { 'deepseek.wrapup': true } : {}),
-                ...(spanOptions?.retry ? { 'deepseek.retry': spanOptions.retry } : {})
+                ...(spanOptions?.retry ? { 'deepseek.retry': spanOptions.retry } : {}),
+                ...(spanOptions?.fallback
+                  ? { 'deepseek.fallback': true, 'deepseek.fallback_reason': spanOptions.fallback }
+                  : {})
               }
             }, rootContext);
 
@@ -878,6 +892,17 @@ export function initTelemetry(options?: TelemetryOptions): TelemetryService | nu
                 } catch (err: unknown) {
                   logCaptureError(err);
                 }
+              },
+
+              recordStream(stats: Pick<StreamStats, 'firstEventMs' | 'keepAlives' | 'end'>): void {
+                if (!llmSpan.isRecording()) {
+                  return;
+                }
+                llmSpan.setAttributes({
+                  ...(stats.firstEventMs === null ? {} : { 'deepseek.first_event_ms': stats.firstEventMs }),
+                  'deepseek.keepalives': stats.keepAlives,
+                  ...(stats.end === null ? {} : { 'deepseek.stream_end': stats.end })
+                });
               },
 
               recordUsage(usage: DeepSeekUsage): void {
