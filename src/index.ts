@@ -516,7 +516,11 @@ async function callModel(
   let stalledOn: string | null = null;
   for (let retry = 0; ; retry++) {
     const route = router.route(Date.now(), stalledOn);
-    const llmSpan = ctx.turnHandle?.startLlmSpan(route.model, iteration, retry > 0 ? { ...options, retry } : options);
+    const llmSpan = ctx.turnHandle?.startLlmSpan(route.model, iteration, {
+      ...options,
+      ...(retry > 0 ? { retry } : {}),
+      fallback: route.fallback
+    });
     const progress = { streamed: false };
     try {
       const firstEventTimeoutMs = router.firstEventTimeoutMs(route, FIRST_EVENT_TIMEOUT.timeoutMs);
@@ -733,6 +737,11 @@ async function streamModelAnswer(
     finished = stats.end !== 'finish_grace';
   } finally {
     clearTimeout(responseTimer);
+    if (stats.end === null && connection.signal.reason instanceof FirstEventTimeoutError) {
+      // No headers by the first-event deadline: the response timer cut the request before any stream.
+      stats.end = 'first_event';
+    }
+    llmSpan?.recordStream(stats);
     logStream(model, stats);
     if (!finished) {
       // A stream that stopped half-way still holds its connection: close it before anything else is sent. A finished

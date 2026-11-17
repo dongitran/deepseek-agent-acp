@@ -332,6 +332,9 @@ test('e2e start-up log: one [config] tracing line names what is captured; an inv
 // Capture off, and what is sent
 // ---------------------------------------------------------------------------
 
+/** What every LLM span whose request was sent records since 0.6.0, capture or not: how its stream went (issue #6). */
+const LLM_STREAM_KEYS = ['deepseek.first_event_ms', 'deepseek.keepalives', 'deepseek.stream_end'];
+
 const LLM_KEYS_0_3_0 = [
   'input.mime_type',
   'input.value',
@@ -359,7 +362,7 @@ const TOOL_KEYS_0_3_0 = [
   'tool.parameters'
 ];
 
-test('e2e capture off: spans carry exactly 0.3.0 attributes and the log says nothing is captured', async () => {
+test('e2e capture off: spans carry 0.3.0 attributes plus how the stream went, and the log says nothing is captured', async () => {
   const run = await runAdapter({ reply: WAIT_THEN_ANSWER });
   for (const span of run.spans) {
     for (const key of Object.keys(span.attributes)) {
@@ -367,7 +370,7 @@ test('e2e capture off: spans carry exactly 0.3.0 attributes and the log says not
     }
   }
   const [, second] = llmSpans(run.spans);
-  assert.deepEqual(Object.keys(second.attributes).sort(), LLM_KEYS_0_3_0);
+  assert.deepEqual(Object.keys(second.attributes).sort(), [...LLM_KEYS_0_3_0, ...LLM_STREAM_KEYS].sort());
   assert.deepEqual(Object.keys(spanNamed(run.spans, 'tool:meeting_wait').attributes).sort(), TOOL_KEYS_0_3_0);
   assert.match(run.stderr, /\[config\] tracing llm_messages=off tool_output=off/);
 });

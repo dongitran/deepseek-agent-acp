@@ -178,3 +178,43 @@ test('a cancel while the fallback attempt is held answers cancelled at once', as
   assert.equal(run.requests[1].model, 'deepseek-v4-pro');
   assert.ok(!run.requests[2].messages.some((message) => message.content === 'hello'), 'the cancelled turn is rolled back');
 });
+
+test('the spans say how each attempt went: keep-alives, the bound that ended it, the time to its first event, the fallback', async () => {
+  const run = await runAdapter({
+    trace: true,
+    prompts: ['hello', 'again'],
+    env: { DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '300', ...FALLBACK },
+    reply: (res, n) => (n === 1 ? hold(res) : sse(res, text(`Answer ${n}.`)))
+  });
+  const llm = run.spans.filter((span) => span.name.startsWith('llm:'));
+  assert.deepEqual(
+    llm.map((span) => span.name),
+    ['llm:deepseek-flash', 'llm:deepseek-v4-pro', 'llm:deepseek-v4-pro'],
+    'each span is named after the model that was asked'
+  );
+  const [held, stalled, cooled] = llm;
+  assert.equal(held.status.code, 2, 'the held attempt is an ERROR span');
+  assert.equal(held.attributes['deepseek.stream_end'], 'first_event');
+  assert.ok(held.attributes['deepseek.keepalives'] >= 1, `${held.attributes['deepseek.keepalives']} keep-alives`);
+  assert.equal(held.attributes['deepseek.first_event_ms'], undefined, 'no useful event came');
+  assert.equal(held.attributes['deepseek.fallback'], undefined);
+  assert.equal(stalled.attributes['deepseek.fallback'], true);
+  assert.equal(stalled.attributes['deepseek.fallback_reason'], 'stall');
+  assert.equal(stalled.attributes['deepseek.retry'], 1);
+  assert.equal(stalled.attributes['deepseek.stream_end'], 'done');
+  assert.equal(stalled.attributes['deepseek.keepalives'], 0);
+  assert.ok(stalled.attributes['deepseek.first_event_ms'] >= 0);
+  assert.equal(cooled.attributes['deepseek.fallback_reason'], 'cooldown');
+  assert.equal(cooled.attributes['deepseek.retry'], undefined, 'the next prompt went straight to the fallback');
+});
+
+test('a request with no headers by the first-event deadline is recorded as ended by that bound', async () => {
+  const run = await runAdapter({
+    trace: true,
+    env: { DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '300', DEEPSEEK_REQUEST_TIMEOUT_MS: '5000', ...FALLBACK },
+    reply: (res, n) => (n > 1 ? sse(res, text('Here.')) : undefined)
+  });
+  const [first] = run.spans.filter((span) => span.name.startsWith('llm:'));
+  assert.equal(first.attributes['deepseek.stream_end'], 'first_event');
+  assert.equal(first.attributes['deepseek.keepalives'], 0);
+});
