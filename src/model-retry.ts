@@ -41,8 +41,13 @@ export class ModelTimeoutError extends Error {
  * inference has not started within 10 minutes; such a close is a failed attempt, never an empty answer.
  */
 export class ModelEmptyStreamError extends Error {
-  constructor() {
-    super('DeepSeek API stream ended before any data of an answer (no text, reasoning, tool call or finish_reason)');
+  /** `finishReason`: the one the stream ended with, if any (`insufficient_system_resource` when DeepSeek was overloaded). */
+  constructor(finishReason: string | null = null) {
+    super(
+      finishReason
+        ? `DeepSeek API stream ended before any data of an answer (finish_reason ${finishReason}, no text, reasoning or tool call)`
+        : 'DeepSeek API stream ended before any data of an answer (no text, reasoning, tool call or finish_reason)'
+    );
     this.name = 'ModelEmptyStreamError';
   }
 }

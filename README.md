@@ -176,8 +176,9 @@ back and answered `error`. So a model call that fails in a way that may pass is 
 - **Only before any text.** A call whose text or reasoning had already been streamed to the client is not sent again,
   so nothing is shown twice. Nothing else of a failed call is ever applied: its tool calls run only after its stream
   has ended, so a retry sends exactly the same messages and repeats no tool call.
-- **Progress, not traffic.** A useful event is a chunk with text, reasoning or tool-call pieces, or a `finish_reason`.
-  Keep-alive comments and metadata-only chunks (the role-only chunk that opens every DeepSeek stream) are not progress:
+- **Progress, not traffic.** A useful event is a chunk with text, reasoning or tool-call pieces, or a `finish_reason`
+  that ends an answer (`insufficient_system_resource`, DeepSeek's "no resources to run it", ends none). Keep-alive
+  comments and metadata-only chunks (the role-only chunk that opens every DeepSeek stream) are not progress:
   - from sending the request, the first useful event must come within `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS`, and until it
     some byte must come within `DEEPSEEK_REQUEST_TIMEOUT_MS` (a keep-alive counts there: a silent connection is still
     cut at that bound);
@@ -197,10 +198,12 @@ back and answered `error`. So a model call that fails in a way that may pass is 
     The switch uses one of the `DEEPSEEK_MAX_RETRIES` attempts; any other failure is sent to the same model again,
     after the usual wait.
   - Without a fallback model, a stall is sent to the same model again, after the usual wait.
-- **Worst case.** Before its first useful event, one model call takes at most `(DEEPSEEK_MAX_RETRIES + 1) ×
-  DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` and the waits: about 15 minutes with the defaults, where 0.5.2 waited for as long as
-  DeepSeek held each attempt (30–45 minutes). A meeting twin with `15000` and a fallback model waits 15 s before the
-  fallback takes the call, and at most about 90 s if both models stall.
+- **Worst case.** Before its first useful event, an attempt takes at most `DEEPSEEK_FIRST_EVENT_TIMEOUT_MS` (at least
+  60 s on the fallback model), and a call makes at most `DEEPSEEK_MAX_RETRIES + 1` attempts, plus the waits between
+  them: about 15 minutes with the defaults, where 0.5.2 waited for as long as DeepSeek held each attempt (30–45
+  minutes). A meeting twin with `15000` and a fallback model waits 15 s before the fallback takes the call. If both
+  models stall, a call takes at most three attempts of 15 s on the primary or 60 s on the fallback: about 135 s
+  when it starts during a cooldown (fallback, primary, fallback), 90 s otherwise.
 - **Cancel.** A `session/cancel` during the wait before a retry answers `cancelled` at once.
 - Each attempt has its own LLM span, named after the model it asked; a retry's carries `deepseek.retry` (1 for the
   first retry), a fallback attempt's `deepseek.fallback`. A call that fails for good ends the turn with `error`, as
@@ -262,12 +265,13 @@ A turn the adapter stopped ends with status ERROR and no `output.value`: `error.
 model calls, whose LLM spans carry `deepseek.wrapup = true`. A message the wrap-up posted links the turn by
 `nostr.posted_event_id`.
 
-Every LLM span whose request was sent says how its stream went: `deepseek.first_event_ms` (from sending the request to
-its first useful event, when one came), `deepseek.keepalives` (the keep-alive comments it had) and
-`deepseek.stream_end`: `done`, `server_close`, `finish_grace` (taken after its `finish_reason` without `[DONE]`), or
+Every LLM span whose attempt got a stream, or no headers by the first-event deadline, says how it went:
+`deepseek.first_event_ms` (from sending the request to its first useful event, when one came), `deepseek.keepalives`
+(the keep-alive comments it had) and `deepseek.stream_end`: `done`, `server_close`, `finish_grace` (taken after its `finish_reason` without `[DONE]`), or
 the bound that cut it, `first_event` or `silence`. An attempt sent to `DEEPSEEK_FALLBACK_MODEL` also carries
 `deepseek.fallback = true` and `deepseek.fallback_reason`: `stall` when the primary model stalled on this call,
-`cooldown` while it cools down from an earlier stall.
+`cooldown` while it cools down from an earlier stall. An attempt that ended with an HTTP error, or that was cancelled
+mid-stream, has an error status and none of the stream attributes.
 
 Everything beyond that is opt-in. With none of these variables set, every span of a turn the model finishes is what
 0.3.0 wrote, plus those three stream attributes on each LLM span.

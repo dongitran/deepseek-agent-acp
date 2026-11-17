@@ -557,7 +557,7 @@ async function callModel(
       const delayMs = next.model === route.model ? retryDelayMs(retry + 1) : 0;
       console.warn(
         `[RETRY] Session ${ctx.sessionId}: model call ${iteration.toString()} failed before any of its text was ` +
-          `streamed (${msg}); sending it ${delayMs > 0 ? `again in ${delayMs.toString()} ms` : `to ${next.model} at once`} ` +
+          `streamed (${msg}); sending it to ${next.model} ${delayMs > 0 ? `again in ${delayMs.toString()} ms` : 'at once'} ` +
           `(retry ${(retry + 1).toString()} of ${maxRetries.toString()}).`
       );
       if (delayMs > 0) {
@@ -734,7 +734,7 @@ async function streamModelAnswer(
     if (stats.usefulEvents === 0) {
       // Keep-alive comments and metadata (the role-only chunk every DeepSeek stream opens with), then the end: DeepSeek
       // closes a request it held for 10 minutes that way. No answer at all, never an empty one.
-      throw new ModelEmptyStreamError();
+      throw new ModelEmptyStreamError(accumulator?.finishReason ?? null);
     }
     // A stream the finish grace ended is still sending keep-alives: its connection is no use to the next call.
     finished = stats.end !== 'finish_grace';

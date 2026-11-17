@@ -42,7 +42,7 @@ test('a request held with keep-alives is cut at DEEPSEEK_FIRST_EVENT_TIMEOUT_MS 
   const gap = deepseek.arrivals[1] - deepseek.arrivals[0];
   // Taken at the mock server: the first request's connection setup is in it, hence the slack under load.
   assert.ok(gap >= 1000 && gap < 3000, `sent again ${gap} ms later: the 300 ms deadline, then the 1 s backoff`);
-  assert.match(run.stderr, /\[RETRY\] .*DEEPSEEK_FIRST_EVENT_TIMEOUT_MS/);
+  assert.match(run.stderr, /\[RETRY\] .*DEEPSEEK_FIRST_EVENT_TIMEOUT_MS.*sending it to deepseek-flash again in 1000 ms/);
   assert.match(run.stderr, /\[STREAM\] deepseek-flash: \d+ keep-alive/);
 });
 
@@ -58,6 +58,7 @@ test('with a fallback, the retry of a stalled call goes to it at once and nothin
   const gap = deepseek.arrivals[1] - deepseek.arrivals[0];
   assert.ok(gap < 1000, `sent to the fallback ${gap} ms later: no backoff, another model's queue`);
   assert.match(run.stderr, /\[FALLBACK\] deepseek-flash stalled .*calls go to deepseek-v4-pro for the next 60 s/);
+  assert.match(run.stderr, /\[RETRY\] .*sending it to deepseek-v4-pro at once/);
 });
 
 test('while the primary cools down the next prompt goes straight to the fallback', async () => {
@@ -95,9 +96,21 @@ test('headers then total silence are cut at DEEPSEEK_REQUEST_TIMEOUT_MS, not at 
 });
 
 test('a complete answer followed by keep-alives without [DONE] is taken after the grace', async () => {
+  const held = {};
+  const timing = {};
   const run = await runAdapter({
     env: { DEEPSEEK_REQUEST_TIMEOUT_MS: '1000' },
+    onPrompt: async (index, { stdout }) => {
+      await waitFor(() => stdout().includes('"id":1,'), 10000, 'the answer');
+      timing.answeredAfterMs = Date.now() - held.at;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      timing.closedBeforeTeardown = held.closedAt !== undefined;
+    },
     reply: (res) => {
+      held.at = Date.now();
+      res.on('close', () => {
+        held.closedAt = Date.now();
+      });
       // The whole answer (its finish_reason and usage), then keep-alives instead of [DONE] (deepseek-harness#6959).
       hold(res);
       for (const chunk of text('Done.')) {
@@ -109,6 +122,8 @@ test('a complete answer followed by keep-alives without [DONE] is taken after th
   assert.equal(run.responses[0].result.message.content, 'Done.');
   assert.equal(run.requests.length, 1);
   assert.match(run.stderr, /\[STREAM\] deepseek-flash: .*finish_reason/);
+  assert.ok(timing.answeredAfterMs < 3000, `answered ${timing.answeredAfterMs} ms after the request: grace min(5000, 1000)`);
+  assert.equal(timing.closedBeforeTeardown, true, 'the adapter closed the connection the grace ended');
 });
 
 test('a tool-call answer followed by keep-alives without [DONE] still runs its tool, once', async () => {
@@ -129,6 +144,50 @@ test('a tool-call answer followed by keep-alives without [DONE] still runs its t
   assert.equal(run.responses[0].result.stopReason, 'end_turn');
   assert.deepEqual(run.calls, ['meeting_wait'], 'the answer was taken and its tool ran, not sent again');
   assert.equal(run.requests.length, 2);
+});
+
+test('a stall on the fallback goes back to the primary, and its answer ends the cooldown', async () => {
+  const stalled = (res) => {
+    res.writeHead(200, SSE_HEADERS);
+    res.write(`data: ${JSON.stringify(ROLE_ONLY)}\n\n`);
+    res.end('data: [DONE]\n\n');
+  };
+  const run = await runAdapter({
+    prompts: ['hello', 'again'],
+    env: { DEEPSEEK_FIRST_EVENT_TIMEOUT_MS: '300', ...FALLBACK },
+    reply: (res, n) => (n <= 2 ? stalled(res) : sse(res, text(`Answer ${n}.`)))
+  });
+  assert.deepEqual(
+    run.responses.map((response) => response.result.stopReason),
+    ['end_turn', 'end_turn']
+  );
+  assert.deepEqual(
+    run.requests.map((request) => request.model),
+    ['deepseek-flash', 'deepseek-v4-pro', 'deepseek-flash', 'deepseek-flash'],
+    'flash stalls, then v4-pro stalls, then flash answers: the next prompt goes to flash again'
+  );
+  assert.match(run.stderr, /\[FALLBACK\] deepseek-flash answered again/);
+});
+
+test('a finish_reason of insufficient_system_resource with no answer is a stall, never an empty answer', async () => {
+  // DeepSeek's finish reason for "insufficient resource of the inference system": the overload this change is about.
+  const run = await runAdapter({
+    env: FALLBACK,
+    reply: (res, n) => {
+      if (n > 1) {
+        sse(res, text('Here.'));
+        return;
+      }
+      res.writeHead(200, SSE_HEADERS);
+      res.write(`data: ${JSON.stringify(ROLE_ONLY)}\n\n`);
+      const overloaded = { choices: [{ index: 0, delta: { content: '' }, finish_reason: 'insufficient_system_resource' }] };
+      res.write(`data: ${JSON.stringify(overloaded)}\n\n`);
+      res.end('data: [DONE]\n\n');
+    }
+  });
+  assert.equal(run.responses[0].result.message.content, 'Here.', 'the overloaded attempt was not taken as the answer');
+  assert.deepEqual(run.requests.map((request) => request.model), ['deepseek-flash', 'deepseek-v4-pro']);
+  assert.match(run.stderr, /\[RETRY\] .*insufficient_system_resource/);
 });
 
 test('a stream with only the role chunk and [DONE] is sent again, never taken as an empty answer', async () => {
@@ -187,7 +246,9 @@ test('a cancel while the fallback attempt is held answers cancelled at once', as
         return;
       }
       await waitFor(() => deepseek.arrivals.length === 2, 10000, 'the fallback attempt');
-      await new Promise((resolve) => setTimeout(resolve, 150));
+      // Its prompt cache starts cold: a fallback attempt waits at least 60 s for its first event, not the 300 ms.
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      timing.arrivalsBeforeCancel = deepseek.arrivals.length;
       const at = Date.now();
       send({ jsonrpc: '2.0', method: 'session/cancel', params: { sessionId: SESSION_ID } });
       await waitFor(() => stdout().includes('"id":1,'), 10000, 'the cancelled turn to answer');
@@ -196,6 +257,7 @@ test('a cancel while the fallback attempt is held answers cancelled at once', as
   });
   assert.equal(run.responses[0].result.stopReason, 'cancelled');
   assert.ok(timing.ms < 500, `answered ${timing.ms} ms after the cancel`);
+  assert.equal(timing.arrivalsBeforeCancel, 2, 'the fallback attempt was not cut at the 300 ms deadline');
   assert.equal(run.requests[1].model, 'deepseek-v4-pro');
   assert.ok(!run.requests[2].messages.some((message) => message.content === 'hello'), 'the cancelled turn is rolled back');
 });

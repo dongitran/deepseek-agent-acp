@@ -278,6 +278,26 @@ test('the finish chunk DeepSeek sends (empty content, finish_reason, usage) then
   assert.equal(run.events.at(-1).accumulator.usage.total_tokens, 12);
 });
 
+test('the first-event deadline counts from sentAt, not from when parsing starts', async () => {
+  // The wait for the response headers counts against it: (retries + 1) × D bounds a call.
+  const run = await drain(scriptedBody([{ delay: 20, text: KEEPALIVE, repeat: 1000 }]), 5000, {
+    sentAt: Date.now() - 1000,
+    firstEventTimeoutMs: 1100
+  });
+  assert.ok(run.error instanceof FirstEventTimeoutError, String(run.error));
+  assert.ok(run.ms < 600, `ended ${run.ms} ms into the stream, not 1100`);
+});
+
+test('a finish_reason of insufficient_system_resource alone is no progress', async () => {
+  const stats = newStats();
+  const overloaded = sse({ choices: [{ index: 0, delta: { content: '' }, finish_reason: 'insufficient_system_resource' }] });
+  const body = scriptedBody([{ delay: 5, text: ROLE_ONLY }, { delay: 5, text: overloaded }, { delay: 5, text: 'data: [DONE]\n\n' }]);
+  const run = await drain(body, 1000, { stats });
+  assert.equal(run.error, null, String(run.error));
+  assert.equal(stats.usefulEvents, 0);
+  assert.equal(run.events.at(-1).accumulator.finishReason, 'insufficient_system_resource');
+});
+
 test('a long answer that started before the first-event deadline runs past it', async () => {
   const stats = newStats();
   const body = scriptedBody([

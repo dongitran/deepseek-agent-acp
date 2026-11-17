@@ -239,13 +239,20 @@ export class StreamAccumulator {
 /** The longest delay a Node.js timer takes (config.ts MAX_TIMER_MS): a longer one would fire at once. */
 const MAX_TIMER_MS = 2_147_483_647;
 
-/** Progress: a chunk with text, reasoning or tool-call pieces, or with a finish_reason of its own. */
+/**
+ * Finish reasons that end no answer: DeepSeek stops a request its inference system has no resources for with
+ * `insufficient_system_resource` — the overload in which it also holds requests with keep-alives.
+ */
+const FAILED_FINISHES: ReadonlySet<string> = new Set(['insufficient_system_resource']);
+
+/** Progress: a chunk with text, reasoning or tool-call pieces, or with a finish_reason of its own that ends an answer. */
 function isUsefulChunk(data: SSEChunkData | undefined, result: ProcessedChunkResult): boolean {
+  const finish = data?.choices?.[0]?.finish_reason;
   return Boolean(
     result.reasoningDelta ||
       result.contentDelta ||
       (result.toolCallChunks && result.toolCallChunks.length > 0) ||
-      data?.choices?.[0]?.finish_reason
+      (finish && !FAILED_FINISHES.has(finish))
   );
 }
 

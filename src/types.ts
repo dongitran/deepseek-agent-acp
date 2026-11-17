@@ -39,7 +39,7 @@ export interface SSEChoiceDelta {
 export interface SSEChoice {
   index?: number;
   delta?: SSEChoiceDelta;
-  finish_reason?: 'stop' | 'tool_calls' | 'length' | null;
+  finish_reason?: 'stop' | 'tool_calls' | 'length' | 'content_filter' | 'insufficient_system_resource' | null;
 }
 
 export interface DeepSeekUsage {
